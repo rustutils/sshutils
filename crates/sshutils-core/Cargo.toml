@@ -1,0 +1,12 @@
+[package]
+name = "sshutils-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+libc = "0.2.191"
+rpassword = "7.5.5"
+russh.workspace = true
+thiserror.workspace = true

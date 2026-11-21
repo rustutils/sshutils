@@ -1,0 +1,18 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.89"
+repository = "https://github.com/rustutils/sshutils"
+
+[workspace.dependencies]
+sshutils-core = { path = "crates/sshutils-core" }
+russh = "0.65.2"
+anyhow = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "net", "signal", "time"] }
+rand = "0.9"
