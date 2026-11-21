@@ -57,6 +57,8 @@ sshutils/
 ├── Cargo.toml            workspace
 ├── crates/
 │   ├── sshutils-core/    shared library (split into smaller crates as it grows)
+│   ├── sshutils-config/  ssh_config parsing and evaluation (Phase 2)
+│   ├── sshutils-testing/ test harness (differential tests, throwaway sshd/agent)
 │   ├── ssh-keygen/
 │   ├── ssh-add/
 │   ├── ssh-agent/
@@ -66,8 +68,14 @@ sshutils/
 │   ├── scp/
 │   ├── sftp/
 │   └── sftp-server/
+├── vendor/russh/         our russh fork (git submodule, branch `sshutils`)
 └── tests/                cross-tool and interop tests
 ```
+
+Missing russh functionality is added in the fork, as small self-contained
+commits meant to become upstream PRs (built first, proposed afterwards).
+russh gets general-purpose protocol support and extension points; OpenSSH's
+policy and behaviour stay in sshutils.
 
 ### Shared library (`sshutils-core`)
 
@@ -95,22 +103,30 @@ sshutils/
   `ssh-keyscan`).
 - **`authorized_keys`** – parse incl. options (for `ssh-keygen` now, `sshd`
   later).
-- **`ssh_config`** – full parser: `Host`, `Match` (all criteria incl. `exec`),
-  `Include`, first-match-wins, `%` tokens, environment expansion, defaults;
-  `ssh -G` output.
+
+`ssh_config` handling lives in its own crate, `sshutils-config`, rather than in
+russh: russh's `russh-config` is a small helper (about ten keywords, no
+`Match`/`Include`), and `ssh_config` semantics are OpenSSH policy.
 
 ## Phases
 
 Each phase ends with: tools installed side-by-side with OpenSSH, golden tests
 passing, interop tests passing.
 
-### Phase 0 – Foundation
+### Phase 0 – Foundation (done)
 
 - Workspace, licenses, CI (build, test, clippy, fmt, `cargo-deny`).
 - Test harness for golden tests and a throwaway OpenSSH `sshd` (see Testing).
 - `sshutils-core` CLI helpers, paths, prompts, key loading, fingerprints.
 
-### Phase 1 – Keys and agent
+### Phase 1 – Keys and agent (done, except the items noted)
+
+Done: `ssh-keygen` generation, `-l`, `-y`, `-p`, `-c`, `-F`, `-R`, `-H`;
+`ssh-add` (all but PKCS#11, FIDO and destination constraints); `ssh-agent`
+(foreground and background, `-k`, `-u`, command mode, socket activation,
+confirmations, hashed lock, peer checks); `SSH_ASKPASS` support. Not done yet:
+`ssh-keygen -e`/`-i`/`-B`. Original scope:
+
 
 - `ssh-keygen`: generate (`-t -b -C -f -N -q -a -Z`), `-l` (`-E`, `-v`), `-y`,
   `-p`, `-c`, `-F`, `-R`, `-H`, `-e`/`-i` (basic formats), `-B` if cheap.
@@ -122,15 +138,37 @@ passing, interop tests passing.
 
 ### Phase 2 – Client
 
-- `ssh_config` complete, `ssh -G`.
-- `ssh`: connect, host key verification against `known_hosts`
-  (`StrictHostKeyChecking`, `UpdateHostKeys` basics), auth (publickey via files
-  and agent, password, keyboard-interactive), exec / pty shell / `-N` / `-T` /
-  `-t`, `-l -p -i -F -o -v -q`, escape sequences, `-L`/`-R`/`-D` forwarding,
-  `-A` agent forwarding, `ProxyJump` / `-J`, `ProxyCommand`, `-W`, `-f`,
-  `SendEnv`/`SetEnv`.
-- `ssh-keyscan`.
-- `ssh-copy-id`.
+1. **`sshutils-config` and `ssh -G`.** OpenSSH's tokenising rules (quotes,
+   `Key=Value`, comments); every keyword of OpenSSH 10.5, including how
+   deprecated and unsupported ones are reported; `Host`, all `Match` criteria
+   (including `exec`, `canonical`, `final`) and `Include`; first match wins,
+   accumulating options (`IdentityFile`, forwards, `SendEnv`); `%` tokens and
+   `${VAR}`; OpenSSH's defaults; algorithm-list syntax (`+`, `-`, `^`);
+   hostname canonicalization. In the `ssh` binary: the full command line
+   (every option mapped onto the config) and `-G`, which prints the resolved
+   configuration without connecting and is compared against OpenSSH's across
+   many config files and command lines.
+2. **Connecting and host keys.** TCP connect (`AddressFamily`,
+   `ConnectTimeout`, `BindAddress`), algorithm negotiation from the config,
+   `known_hosts` verification with every `StrictHostKeyChecking` mode,
+   OpenSSH's prompts and warnings, `HashKnownHosts`, `UpdateHostKeys`,
+   `CheckHostIP`; `ssh -Q`.
+3. **Authentication.** Methods in `PreferredAuthentications` order; keys from
+   files and the agent (`IdentitiesOnly`), certificates (`CertificateFile`),
+   `AddKeysToAgent`; password and keyboard-interactive; `BatchMode`; banners;
+   agent session binding.
+4. **Sessions.** Exec and shell, terminal handling (raw mode, window size),
+   `-t`/`-T`, `-n`, `-N`, stdio and the remote exit status, `SendEnv`/`SetEnv`,
+   `RemoteCommand`, escape sequences, `-q`/`-v`, `-f`. The test harness gains
+   pseudo-terminal support for interactive tests.
+5. **Forwarding.** `-L`, `-R`, `-D` (SOCKS4/5), `-W`, Unix socket forwards,
+   `ExitOnForwardFailure`, `GatewayPorts`, agent forwarding (`-A`).
+6. **`ProxyCommand` and `ProxyJump`** (`-J`, including chains).
+7. **`ssh-keyscan` and `ssh-copy-id`.**
+
+Deferred to Phase 4: connection sharing (`ControlMaster`/`-O`), tunnel devices
+(`-w`), X11 forwarding, FIDO and PKCS#11 keys, `VerifyHostKeyDNS`,
+`KnownHostsCommand`.
 
 ### Phase 3 – File transfer
 
@@ -172,22 +210,26 @@ passing, interop tests passing.
   OpenSSH and checked in.
 - Later: fuzzing of the parsers (`cargo fuzz`).
 
-## Known gaps in russh to investigate
+## russh: gaps and status
 
-To verify early, as they affect feasibility of exact behaviour:
+Fixed or added in the fork (agent work, Phase 1): agent client framing bugs,
+key comments and certificates when adding keys, `query`/`remove_certificate`,
+typed agent protocol messages (`agent::proto`), and an in-memory agent server
+that keeps order, comments and certificates.
 
-- Host-key algorithm negotiation control (needed for `HostKeyAlgorithms`,
-  `ssh-keyscan -t`).
-- Certificate-based host and user auth coverage.
-- `-sk` key algorithms on the wire.
-- Keyboard-interactive and password-change flows.
-- Hooks needed for `ProxyCommand` / `ProxyJump` (custom transport stream).
-- Algorithm-list syntax (`+`, `-`, `^` prefixes in `Ciphers`, `KexAlgorithms`,
-  …) mapping to russh `Preferred`.
-- GSSAPI: not supported; reject with a clear message (out of scope).
+The client already covers the protocol side of `ssh` (auth methods including
+certificates and pluggable GSSAPI, all channel types, remote forwarding,
+keepalives, rekeying, `hostkeys-prove`, agent session binding, connecting
+over any stream). To verify early in Phase 2:
 
-Gaps are handled by contributing upstream to russh where reasonable, otherwise
-working around them locally.
+- Per-connection host-key algorithm preferences (OpenSSH orders them by
+  what's in `known_hosts`; also needed for `ssh-keyscan -t`).
+- `server-sig-algs` and RSA SHA-2 negotiation against OpenSSH's `sshd`.
+- Algorithm coverage compared to OpenSSH (for `-Q` and the algorithm-list
+  syntax).
+- `ssh -f`: OpenSSH forks after authentication, while our async runtime is
+  running.
+- `-sk` key algorithms on the wire (Phase 4).
 
 ## Open questions
 
