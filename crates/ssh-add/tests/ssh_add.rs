@@ -86,8 +86,28 @@ fn fixtures(openssh: &Openssh) -> TempDir {
         "old.pub",
     ]);
     fs::copy(d.join("user-cert.pub"), d.join("mis-cert.pub")).unwrap();
+    write_askpass_programs(d);
     fs::set_permissions(d.join("open"), fs::Permissions::from_mode(0o644)).unwrap();
     dir
+}
+
+/// Askpass programs: `ok.sh` answers `pw`, `cancel.sh` cancels. Both log
+/// how they were called to `askpass.log`.
+fn write_askpass_programs(dir: &Path) {
+    let programs = [
+        (
+            "ok.sh",
+            "#!/bin/sh\nprintf 'args=[%s] hint=[%s]\\n' \"$*\" \"$SSH_ASKPASS_PROMPT\" >> askpass.log\necho pw\n",
+        ),
+        (
+            "cancel.sh",
+            "#!/bin/sh\nprintf 'cancelled [%s]\\n' \"$*\" >> askpass.log\nexit 1\n",
+        ),
+    ];
+    for (name, script) in programs {
+        fs::write(dir.join(name), script).unwrap();
+        fs::set_permissions(dir.join(name), fs::Permissions::from_mode(0o755)).unwrap();
+    }
 }
 
 /// Copy every fixture into `dir`, keeping file modes.
@@ -335,5 +355,65 @@ fn constraints_take_effect() {
     for run in [&c.ours, &c.theirs] {
         let out = openssh_ssh_add(&openssh, run.dir.path(), &["-T", "plain.pub"]);
         assert_eq!(out.status, Some(1), "signing should need confirmation");
+    }
+}
+
+#[test]
+fn askpass() {
+    let openssh = require_openssh!();
+    let fixtures = fixtures(&openssh);
+    // (environment, stdin)
+    let cases: &[(&[(&str, &str)], &str)] = &[
+        (&[("DISPLAY", ":0"), ("SSH_ASKPASS", "./ok.sh")], ""),
+        (&[("SSH_ASKPASS", "./ok.sh")], ""),
+        (
+            &[("SSH_ASKPASS", "./ok.sh"), ("SSH_ASKPASS_REQUIRE", "force")],
+            "",
+        ),
+        (
+            &[("SSH_ASKPASS", "./ok.sh"), ("SSH_ASKPASS_REQUIRE", "FORCE")],
+            "",
+        ),
+        (
+            &[
+                ("DISPLAY", ":0"),
+                ("SSH_ASKPASS", "./ok.sh"),
+                ("SSH_ASKPASS_REQUIRE", "never"),
+            ],
+            "pw\n",
+        ),
+        (
+            &[
+                ("DISPLAY", ":0"),
+                ("SSH_ASKPASS", "./ok.sh"),
+                ("SSH_ASKPASS_REQUIRE", "prefer"),
+            ],
+            "",
+        ),
+        (
+            &[
+                ("SSH_ASKPASS", "./ok.sh"),
+                ("SSH_ASKPASS_REQUIRE", "prefer"),
+            ],
+            "",
+        ),
+        (&[("DISPLAY", ""), ("SSH_ASKPASS", "./ok.sh")], ""),
+        (&[("DISPLAY", ":0"), ("SSH_ASKPASS", "./cancel.sh")], ""),
+        (&[("DISPLAY", ":0"), ("SSH_ASKPASS", "./missing.sh")], ""),
+    ];
+    for (env, stdin) in cases {
+        let differential = ssh_add(&openssh);
+        let mut case = differential
+            .case(["enc", "enc2"])
+            .agent(&openssh)
+            .setup(|dir| install(fixtures.path(), dir))
+            .stdin(*stdin);
+        for (key, value) in *env {
+            case = case.env(*key, *value);
+        }
+        case.run()
+            .assert_same_outcome()
+            .assert_same_agent(&openssh)
+            .assert_same_file("askpass.log");
     }
 }
