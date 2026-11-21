@@ -40,7 +40,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Install OpenSSH (reference implementation for tests)
+        run: sudo apt-get update && sudo apt-get install -y openssh-client openssh-server
       - run: cargo test --workspace --locked
+        env:
+          # Fail rather than skip tests that compare against OpenSSH.
+          SSHUTILS_REQUIRE_OPENSSH: 1
 
   msrv:
     name: MSRV

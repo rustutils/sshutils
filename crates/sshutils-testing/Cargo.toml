@@ -1,0 +1,14 @@
+[package]
+name = "sshutils-testing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+description = "Test harness for sshutils: differential tests against OpenSSH and a throwaway sshd"
+
+[dependencies]
+libc.workspace = true
+tempfile.workspace = true
+
