@@ -93,3 +93,34 @@ fn children_have_no_terminal() {
     assert_ne!(out.status, Some(0));
     assert_ne!(out.status, None, "timed out waiting for a terminal");
 }
+
+#[test]
+fn cases_can_run_against_a_fresh_agent() {
+    let openssh = require_openssh!();
+    let keygen = openssh.require_tool("ssh-keygen");
+    let fixtures = tempfile::tempdir().unwrap();
+    let out = run(
+        command(&keygen, fixtures.path())
+            .args(["-q", "-t", "ed25519", "-N", "", "-C", "c", "-f", "k"]),
+        b"",
+    );
+    assert_eq!(out.status, Some(0));
+    let copy = |dir: &std::path::Path| {
+        for name in ["k", "k.pub"] {
+            fs::copy(fixtures.path().join(name), dir.join(name)).unwrap();
+        }
+    };
+
+    let ssh_add = openssh.require_tool("ssh-add");
+    let diff = Differential::new(&ssh_add, &ssh_add);
+    // Each run starts with an empty agent of its own.
+    let c = diff.case(["-l"]).agent(&openssh).run();
+    c.assert_same_outcome().assert_same_agent(&openssh);
+    assert_eq!(c.ours.outcome.status, Some(1), "{}", c.ours.outcome.stderr);
+
+    // Adding a key changes that run's agent only.
+    let c = diff.case(["k"]).agent(&openssh).setup(copy).run();
+    c.assert_same_outcome().assert_same_agent(&openssh);
+    let agent = c.ours.agent.as_ref().unwrap();
+    assert!(agent.identities(&openssh).starts_with("ssh-ed25519 "));
+}

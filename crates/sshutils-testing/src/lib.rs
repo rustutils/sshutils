@@ -5,6 +5,8 @@
 //! - [`Differential`] runs one of our tools and its OpenSSH counterpart with
 //!   the same arguments in identical scratch directories and compares the
 //!   results.
+//! - [`Agent`] starts a throwaway OpenSSH `ssh-agent`; a [`Case`] can give
+//!   each implementation its own.
 //! - [`Sshd`] starts a throwaway, unprivileged OpenSSH server on a free
 //!   localhost port, with keys and a client config to log in to it.
 //!
@@ -14,11 +16,13 @@
 //! (and our tools) find `~/.ssh` through the passwd database, not `$HOME`, so
 //! tests must always name their files explicitly (`-f`, `-F`, ...).
 
+mod agent;
 mod differential;
 mod openssh;
 mod process;
 mod sshd;
 
+pub use agent::{AGENT_SOCKET, Agent};
 pub use differential::{Case, Comparison, Differential, Run};
 pub use openssh::Openssh;
 pub use process::{Outcome, command, run};

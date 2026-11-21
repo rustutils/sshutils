@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 
 use tempfile::TempDir;
 
+use crate::Openssh;
+use crate::agent::{AGENT_SOCKET, Agent};
 use crate::process::{self, Outcome};
 
 /// Runs our implementation of a tool and OpenSSH's side by side.
@@ -44,6 +46,8 @@ impl Differential {
             args: args.into_iter().map(Into::into).collect(),
             setup: None,
             stdin: Vec::new(),
+            env: Vec::new(),
+            agent: None,
         }
     }
 }
@@ -56,6 +60,8 @@ pub struct Case<'a> {
     args: Vec<OsString>,
     setup: Option<Setup<'a>>,
     stdin: Vec<u8>,
+    env: Vec<(OsString, OsString)>,
+    agent: Option<&'a Openssh>,
 }
 
 impl<'a> Case<'a> {
@@ -72,6 +78,21 @@ impl<'a> Case<'a> {
         self
     }
 
+    /// Set an environment variable for both implementations.
+    pub fn env(mut self, key: impl Into<OsString>, value: impl Into<OsString>) -> Self {
+        self.env.push((key.into(), value.into()));
+        self
+    }
+
+    /// Give each implementation its own fresh OpenSSH `ssh-agent`, with
+    /// `SSH_AUTH_SOCK` pointing at it. The agent is started before
+    /// [`setup`](Self::setup) runs, at [`AGENT_SOCKET`] in the scratch
+    /// directory, so setup can load keys into it.
+    pub fn agent(mut self, openssh: &'a Openssh) -> Self {
+        self.agent = Some(openssh);
+        self
+    }
+
     pub fn run(self) -> Comparison {
         let ours = self.run_one(&self.differential.ours);
         let theirs = self.run_one(&self.differential.theirs);
@@ -84,14 +105,26 @@ impl<'a> Case<'a> {
 
     fn run_one(&self, program: &Path) -> Run {
         let dir = tempfile::tempdir().expect("create scratch directory");
+        let agent = self
+            .agent
+            .map(|openssh| Agent::start(openssh, &dir.path().join(AGENT_SOCKET)));
         if let Some(setup) = &self.setup {
             setup(dir.path());
         }
-        let outcome = process::run(
-            process::command(program, dir.path()).args(&self.args),
-            &self.stdin,
-        );
-        Run { dir, outcome }
+        let mut command = process::command(program, dir.path());
+        command.args(&self.args);
+        for (key, value) in &self.env {
+            command.env(key, value);
+        }
+        if let Some(agent) = &agent {
+            command.env("SSH_AUTH_SOCK", agent.socket());
+        }
+        let outcome = process::run(&mut command, &self.stdin);
+        Run {
+            dir,
+            outcome,
+            agent,
+        }
     }
 }
 
@@ -101,6 +134,8 @@ impl<'a> Case<'a> {
 pub struct Run {
     pub dir: TempDir,
     pub outcome: Outcome,
+    /// The run's agent, if the case asked for one.
+    pub agent: Option<Agent>,
 }
 
 impl Run {
@@ -136,6 +171,24 @@ impl Comparison {
                 theirs.status,
                 theirs.stdout,
                 theirs.stderr,
+            );
+        }
+        self
+    }
+
+    /// Assert both runs' agents hold the same identities afterwards.
+    pub fn assert_same_agent(&self, openssh: &Openssh) -> &Self {
+        let identities = |run: &Run| {
+            run.agent
+                .as_ref()
+                .expect("case was run with .agent()")
+                .identities(openssh)
+        };
+        let (ours, theirs) = (identities(&self.ours), identities(&self.theirs));
+        if ours != theirs {
+            panic!(
+                "agent contents differ for args {:?}\n--- ours:\n{ours}\n--- OpenSSH:\n{theirs}",
+                self.args
             );
         }
         self
