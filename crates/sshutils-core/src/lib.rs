@@ -4,6 +4,7 @@
 //! (option parsing, path conventions, passphrase prompts, key display) lives
 //! here so the binaries stay thin.
 
+pub mod cli;
 pub mod keyfmt;
 pub mod paths;
 pub mod tty;
