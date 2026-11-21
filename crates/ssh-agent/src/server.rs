@@ -1,7 +1,7 @@
 //! Listening on the agent socket and serving connections.
 
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use russh::keys::agent::proto::{self, Request, Response};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -12,51 +12,51 @@ use crate::store::Store;
 
 type Shared = Arc<Mutex<Store>>;
 
-/// Files to remove when the agent exits.
-pub struct Cleanup {
-    pub socket: PathBuf,
-    /// Temporary directory holding the socket (`-T`).
-    pub directory: Option<PathBuf>,
+/// How the agent runs.
+pub struct Options {
+    pub debug: bool,
+    /// Exit on SIGINT (foreground modes); otherwise it is ignored.
+    pub handle_interrupt: bool,
+    /// In command mode: exit once this process (the command) is no longer
+    /// our parent.
+    pub parent: Option<u32>,
 }
 
-impl Cleanup {
-    pub fn run(&self) {
-        let _ = std::fs::remove_file(&self.socket);
-        if let Some(directory) = &self.directory {
-            let _ = std::fs::remove_dir(directory);
-        }
-    }
+/// Why the agent stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stop {
+    Signal(i32),
+    ParentExited,
 }
 
-/// Bind the agent socket with mode 0600, like OpenSSH (which sets a umask
-/// of 0177 around `bind`). Existing files are never replaced.
-pub fn bind(path: &Path) -> std::io::Result<std::os::unix::net::UnixListener> {
-    // SAFETY: umask only changes this process's file creation mask; we
-    // restore it right after binding, before any other thread exists.
-    let previous = unsafe { libc::umask(0o177) };
-    let result = std::os::unix::net::UnixListener::bind(path);
-    unsafe { libc::umask(previous) };
-    let listener = result?;
-    listener.set_nonblocking(true)?;
-    Ok(listener)
-}
+/// How often command mode checks that the command is still running.
+const PARENT_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Serve until a terminating signal arrives; then clean up and return the
-/// signal number.
+/// Serve until a terminating signal arrives or, in command mode, the
+/// command exits.
 ///
 /// `ready` runs once the signal handlers are in place, so anything it
 /// announces (like the environment) can't race with an early SIGTERM.
 pub async fn run(
     listener: std::os::unix::net::UnixListener,
     store: Store,
-    debug: bool,
+    options: Options,
     ready: impl FnOnce(),
-) -> std::io::Result<i32> {
+) -> std::io::Result<Stop> {
+    listener.set_nonblocking(true)?;
     let listener = UnixListener::from_std(listener)?;
+    let debug = options.debug;
     let store: Shared = Arc::new(Mutex::new(store));
     let mut terminate = signal(SignalKind::terminate())?;
     let mut hangup = signal(SignalKind::hangup())?;
-    let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut interrupt = if options.handle_interrupt {
+        Some(signal(SignalKind::interrupt())?)
+    } else {
+        None
+    };
+    // SIGUSR1 removes all keys, as in OpenSSH.
+    let mut drop_keys = signal(SignalKind::user_defined1())?;
+    let mut parent_check = tokio::time::interval(PARENT_CHECK_INTERVAL);
     ready();
     loop {
         tokio::select! {
@@ -74,9 +74,22 @@ pub async fn run(
                     }
                 });
             }
-            _ = terminate.recv() => return Ok(libc::SIGTERM),
-            _ = hangup.recv() => return Ok(libc::SIGHUP),
-            _ = interrupt.recv() => return Ok(libc::SIGINT),
+            _ = terminate.recv() => return Ok(Stop::Signal(libc::SIGTERM)),
+            _ = hangup.recv() => return Ok(Stop::Signal(libc::SIGHUP)),
+            Some(_) = async { interrupt.as_mut()?.recv().await } => {
+                return Ok(Stop::Signal(libc::SIGINT));
+            }
+            _ = drop_keys.recv() => {
+                eprintln!("signal {} received; removing all keys", libc::SIGUSR1);
+                store.lock().unwrap_or_else(|e| e.into_inner()).remove_all();
+            }
+            _ = parent_check.tick(), if options.parent.is_some() => {
+                // SAFETY: getppid has no preconditions.
+                let parent = unsafe { libc::getppid() };
+                if options.parent != u32::try_from(parent).ok() {
+                    return Ok(Stop::ParentExited);
+                }
+            }
         }
     }
 }

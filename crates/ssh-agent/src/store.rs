@@ -116,6 +116,11 @@ impl Store {
         (response, followup)
     }
 
+    /// Remove all keys (SIGUSR1).
+    pub fn remove_all(&mut self) {
+        self.entries.clear();
+    }
+
     /// Drop keys whose lifetime has passed.
     pub fn remove_expired(&mut self) {
         let now = Instant::now();

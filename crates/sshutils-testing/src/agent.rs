@@ -69,6 +69,15 @@ impl Agent {
         agent
     }
 
+    /// Send `signal` to the agent.
+    pub fn signal(&self, signal: i32) {
+        let pid = libc::pid_t::try_from(self.child.id()).expect("pid fits pid_t");
+        // SAFETY: plain kill(2) on our own child process.
+        unsafe {
+            libc::kill(pid, signal);
+        }
+    }
+
     /// Send SIGTERM and wait for the agent to exit; returns its exit code.
     pub fn terminate(mut self) -> Option<i32> {
         let pid = libc::pid_t::try_from(self.child.id()).expect("pid fits pid_t");

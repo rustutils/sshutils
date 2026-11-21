@@ -53,6 +53,9 @@ jobs:
         env:
           # Fail rather than skip tests that compare against OpenSSH.
           SSHUTILS_REQUIRE_OPENSSH: 1
+          # CI runners have a throwaway home directory, so tests may use
+          # ~/.ssh/agent.
+          SSHUTILS_TEST_HOME_AGENT: 1
 
   msrv:
     name: MSRV
