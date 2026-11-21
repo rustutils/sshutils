@@ -1723,15 +1723,25 @@ dependencies = [
 [[package]]
 name = "ssh-keygen"
 version = "0.1.0"
+dependencies = [
+ "clap",
+ "russh",
+ "sshutils-core",
+ "sshutils-testing",
+ "tempfile",
+]
 
 [[package]]
 name = "sshutils-core"
 version = "0.1.0"
 dependencies = [
+ "base64ct",
  "clap",
  "libc",
+ "md5",
  "rpassword",
  "russh",
+ "sha1",
 ]
 
 [[package]]

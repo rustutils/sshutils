@@ -7,7 +7,10 @@ rust-version.workspace = true
 repository.workspace = true
 
 [dependencies]
+base64ct.workspace = true
 clap.workspace = true
 libc.workspace = true
+md5.workspace = true
 rpassword.workspace = true
 russh.workspace = true
+sha1.workspace = true
