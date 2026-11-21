@@ -79,6 +79,21 @@ fn fixtures(openssh: &Openssh) -> TempDir {
         "user",
     ]);
     keygen(&["-q", "-s", "ca", "-I", "user-id", "-n", "alice", "user.pub"]);
+    // Askpass programs answering confirmations; each logs its prompt and
+    // SSH_ASKPASS_PROMPT.
+    for (name, answer) in [
+        ("yes.sh", "echo yes"),
+        ("upper.sh", "echo YES"),
+        ("empty.sh", "echo"),
+        ("no.sh", "echo no"),
+        ("fail.sh", "exit 1"),
+    ] {
+        let script = format!(
+            "#!/bin/sh\nprintf '[%s] hint=%s\\n' \"$1\" \"$SSH_ASKPASS_PROMPT\" >> askpass.log\n{answer}\n"
+        );
+        fs::write(d.join(name), script).unwrap();
+        fs::set_permissions(d.join(name), fs::Permissions::from_mode(0o755)).unwrap();
+    }
     dir
 }
 
@@ -89,19 +104,21 @@ fn install(fixtures: &Path, dir: &Path) {
     }
 }
 
-/// Run `steps` against a fresh agent (`program` with `agent_args`), using
-/// OpenSSH's ssh-add as the client. Returns each ssh-add outcome.
+/// Run `steps` against a fresh agent (`program` with `agent_args` and
+/// `agent_env`), using OpenSSH's ssh-add as the client. Returns each
+/// ssh-add outcome, and what the askpass programs logged.
 fn session(
     openssh: &Openssh,
     fixtures: &Path,
     program: &Path,
     agent_args: &[&str],
+    agent_env: &[(&str, &str)],
     steps: &[Step],
-) -> Vec<Outcome> {
+) -> (Vec<Outcome>, String) {
     let dir = tempfile::tempdir().unwrap();
     install(fixtures, dir.path());
     let socket = dir.path().join("agent.sock");
-    let agent = Agent::start_program(program, agent_args, &socket);
+    let agent = Agent::start_program_with_env(program, agent_args, agent_env, &socket);
     let mut outcomes = Vec::new();
     for step in steps {
         match step {
@@ -115,19 +132,41 @@ fn session(
         }
     }
     drop(agent);
-    outcomes
+    let log = fs::read_to_string(dir.path().join("askpass.log")).unwrap_or_default();
+    (outcomes, log)
 }
 
 /// Run the session against both agents and compare every step.
 fn compare(openssh: &Openssh, fixtures: &Path, agent_args: &[&str], steps: &[Step]) {
-    let theirs = session(
+    compare_with_env(openssh, fixtures, agent_args, &[], steps);
+}
+
+/// Like [`compare`], with environment variables for the agents; also
+/// compares how the agents called askpass programs.
+fn compare_with_env(
+    openssh: &Openssh,
+    fixtures: &Path,
+    agent_args: &[&str],
+    agent_env: &[(&str, &str)],
+    steps: &[Step],
+) {
+    let theirs_program = openssh.require_tool("ssh-agent");
+    let (theirs, theirs_log) = session(
         openssh,
         fixtures,
-        &openssh.require_tool("ssh-agent"),
+        &theirs_program,
         agent_args,
+        agent_env,
         steps,
     );
-    let ours = session(openssh, fixtures, Path::new(OURS), agent_args, steps);
+    let (ours, ours_log) = session(
+        openssh,
+        fixtures,
+        Path::new(OURS),
+        agent_args,
+        agent_env,
+        steps,
+    );
     let commands = steps.iter().filter_map(|step| match step {
         SshAdd(args, _) => Some(args),
         Sleep(_) => None,
@@ -136,11 +175,12 @@ fn compare(openssh: &Openssh, fixtures: &Path, agent_args: &[&str], steps: &[Ste
         assert_eq!(
             (ours.status, &ours.stdout),
             (theirs.status, &theirs.stdout),
-            "ssh-add {args:?} (agent args {agent_args:?})\nours: {}\nOpenSSH: {}",
+            "ssh-add {args:?} (agent args {agent_args:?}, env {agent_env:?})\nours: {}\nOpenSSH: {}",
             ours.stderr,
             theirs.stderr,
         );
     }
+    assert_eq!(ours_log, theirs_log, "askpass calls (env {agent_env:?})");
 }
 
 #[test]
@@ -201,6 +241,8 @@ fn locking() {
         &[],
         &[
             SshAdd(&["plain"], ""),
+            // An empty passphrase can't lock the agent.
+            SshAdd(&["-x"], "\n\n"),
             SshAdd(&["-X"], "secret\n"),
             SshAdd(&["-x"], "secret\nsecret\n"),
             SshAdd(&["-x"], "again\nagain\n"),
@@ -379,4 +421,79 @@ fn temporary_socket_directory() {
 unsafe extern "C" {
     #[link_name = "kill"]
     fn libc_kill(pid: i32, signal: i32) -> i32;
+}
+
+#[test]
+fn confirmations() {
+    let openssh = require_openssh!();
+    let fixtures = fixtures(&openssh);
+    let steps = &[
+        SshAdd(&["-c", "plain", "rsa", "user"], ""),
+        SshAdd(&["-T", "plain.pub"], ""),
+        SshAdd(&["-T", "rsa.pub"], ""),
+        SshAdd(&["-T", "user-cert.pub"], ""),
+    ];
+    let display = ("DISPLAY", ":0");
+    let cases: &[&[(&str, &str)]] = &[
+        &[display, ("SSH_ASKPASS", "./yes.sh")],
+        &[display, ("SSH_ASKPASS", "./upper.sh")],
+        &[display, ("SSH_ASKPASS", "./empty.sh")],
+        &[display, ("SSH_ASKPASS", "./no.sh")],
+        &[display, ("SSH_ASKPASS", "./fail.sh")],
+        &[display, ("SSH_ASKPASS", "./missing.sh")],
+        &[("SSH_ASKPASS", "./yes.sh")],
+        &[
+            ("SSH_ASKPASS", "./yes.sh"),
+            ("SSH_ASKPASS_REQUIRE", "force"),
+        ],
+        &[
+            display,
+            ("SSH_ASKPASS", "./yes.sh"),
+            ("SSH_ASKPASS_REQUIRE", "never"),
+        ],
+    ];
+    for env in cases {
+        compare_with_env(&openssh, fixtures.path(), &[], env, steps);
+    }
+    // The prompt's fingerprint follows the agent's -E.
+    compare_with_env(
+        &openssh,
+        fixtures.path(),
+        &["-E", "md5"],
+        &[display, ("SSH_ASKPASS", "./yes.sh")],
+        steps,
+    );
+}
+
+#[test]
+fn failed_unlocks_are_delayed() {
+    let openssh = require_openssh!();
+    let fixtures = fixtures(&openssh);
+    for program in [PathBuf::from(OURS), openssh.require_tool("ssh-agent")] {
+        let dir = tempfile::tempdir().unwrap();
+        install(fixtures.path(), dir.path());
+        let socket = dir.path().join("agent.sock");
+        let _agent = Agent::start_program(&program, &[], &socket);
+        let ssh_add = |args: &[&str], stdin: &str| {
+            run(
+                command(openssh.require_tool("ssh-add"), dir.path())
+                    .env("SSH_AUTH_SOCK", &socket)
+                    .args(args),
+                stdin.as_bytes(),
+            )
+        };
+        assert_eq!(ssh_add(&["-x"], "pw\npw\n").status, Some(0));
+        // Three failures wait 0.1 + 0.2 + 0.3 seconds.
+        let started = std::time::Instant::now();
+        for _ in 0..3 {
+            assert_eq!(ssh_add(&["-X"], "wrong\n").status, Some(1));
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(600),
+            "{}: {elapsed:?}",
+            program.display()
+        );
+        assert_eq!(ssh_add(&["-X"], "pw\n").status, Some(0));
+    }
 }

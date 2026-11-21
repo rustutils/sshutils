@@ -35,6 +35,17 @@ impl Agent {
     /// to appear. Its stdout and stderr go to `<socket>.stdout` and
     /// `<socket>.stderr`.
     pub fn start_program(program: &Path, args: &[&str], socket: &Path) -> Agent {
+        Self::start_program_with_env(program, args, &[], socket)
+    }
+
+    /// Like [`start_program`](Self::start_program), with extra environment
+    /// variables for the agent (e.g. `DISPLAY` and `SSH_ASKPASS`).
+    pub fn start_program_with_env(
+        program: &Path,
+        args: &[&str],
+        env: &[(&str, &str)],
+        socket: &Path,
+    ) -> Agent {
         let dir = socket.parent().unwrap_or(Path::new("."));
         let output = |suffix: &str| {
             let mut name = socket.as_os_str().to_owned();
@@ -42,6 +53,7 @@ impl Agent {
             Stdio::from(File::create(PathBuf::from(name)).expect("create agent output file"))
         };
         let child = process::command(program, dir)
+            .envs(env.iter().copied())
             .args(args)
             .arg("-D")
             .arg("-a")

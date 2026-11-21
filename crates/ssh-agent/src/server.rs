@@ -8,7 +8,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{SignalKind, signal};
 
-use crate::store::Store;
+use sshutils_core::tty;
+
+use crate::store::{Answer, Followup, Store};
 
 type Shared = Arc<Mutex<Store>>;
 
@@ -62,6 +64,12 @@ pub async fn run(
         tokio::select! {
             accepted = listener.accept() => {
                 let Ok((stream, _)) = accepted else { continue };
+                if !peer_allowed(&stream) {
+                    if debug {
+                        eprintln!("debug1: refusing connection from another user");
+                    }
+                    continue;
+                }
                 if debug {
                     eprintln!("debug1: new connection");
                 }
@@ -110,17 +118,41 @@ async fn serve_connection(
         let mut payload = vec![0; len];
         stream.read_exact(&mut payload).await?;
 
-        let (response, followup) = match Request::decode(&payload) {
+        let answer = match Request::decode(&payload) {
             Ok(request) => {
                 if debug {
                     eprintln!("debug1: request type {}", payload[0]);
                 }
-                let mut store = store.lock().unwrap_or_else(|e| e.into_inner());
-                store.handle(request)
+                store
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .handle(request)
             }
             // Malformed messages get a failure; the connection stays open.
-            Err(_) => (Response::Failure, Default::default()),
+            Err(_) => Answer::Respond(Response::Failure, Followup::default()),
         };
+        let (response, followup) = match answer {
+            Answer::Respond(response, followup) => (response, followup),
+            Answer::Confirm { prompt, request } => {
+                // Asking runs an external program; don't hold up other
+                // connections meanwhile.
+                let allowed = tokio::task::spawn_blocking(move || tty::ask_permission(&prompt))
+                    .await
+                    .unwrap_or(false);
+                let response = if allowed {
+                    store
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .sign_confirmed(&request)
+                } else {
+                    Response::Failure
+                };
+                (response, Followup::default())
+            }
+        };
+        if let Some(delay) = followup.delay {
+            tokio::time::sleep(delay).await;
+        }
         if let Some(after) = followup.expire_after {
             let store = store.clone();
             tokio::spawn(async move {
@@ -137,5 +169,32 @@ async fn serve_connection(
             .and_then(|payload| proto::frame(&payload))
             .map_err(|e| std::io::Error::other(e.to_string()))?;
         stream.write_all(&encoded).await?;
+    }
+}
+
+/// Only the agent's own user (and root) may use it, as in OpenSSH.
+fn peer_allowed(stream: &UnixStream) -> bool {
+    // SAFETY: getuid has no preconditions.
+    let own = unsafe { libc::getuid() };
+    stream
+        .peer_cred()
+        .is_ok_and(|cred| allowed_uid(cred.uid(), own))
+}
+
+fn allowed_uid(peer: u32, own: u32) -> bool {
+    peer == 0 || peer == own
+}
+
+#[cfg(test)]
+mod tests {
+    use super::allowed_uid;
+
+    #[test]
+    fn only_root_and_the_same_user_are_allowed() {
+        assert!(allowed_uid(1000, 1000));
+        assert!(allowed_uid(0, 1000));
+        assert!(!allowed_uid(1001, 1000));
+        assert!(allowed_uid(0, 0));
+        assert!(!allowed_uid(1000, 0));
     }
 }

@@ -45,30 +45,48 @@ pub fn read_passphrase(prompt: &str) -> io::Result<String> {
     }
 }
 
+/// Ask a yes/no question through the askpass program, like OpenSSH's
+/// `ask_permission` (used for `ssh-agent` key confirmations). The program
+/// gets `SSH_ASKPASS_PROMPT=confirm`; an empty answer or `yes` (any case)
+/// means yes. Without an allowed askpass program, the answer is no.
+pub fn ask_permission(prompt: &str) -> bool {
+    let display = std::env::var_os("DISPLAY");
+    let require = std::env::var_os("SSH_ASKPASS_REQUIRE");
+    if !askpass_rules(display.as_deref(), require.as_deref()).0 {
+        return false;
+    }
+    match run_askpass(prompt, Some("confirm")) {
+        Some(answer) => answer.is_empty() || answer.eq_ignore_ascii_case("yes"),
+        None => false,
+    }
+}
+
+/// `(allowed, preferred)` for an askpass program given `DISPLAY` and
+/// `SSH_ASKPASS_REQUIRE`.
+fn askpass_rules(
+    display: Option<&std::ffi::OsStr>,
+    require: Option<&std::ffi::OsStr>,
+) -> (bool, bool) {
+    let allowed = display.is_some_and(|d| !d.is_empty());
+    match require
+        .map(|r| r.to_string_lossy().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("force") => (true, true),
+        Some("prefer") => (allowed, allowed),
+        Some("never") => (false, false),
+        _ => (allowed, false),
+    }
+}
+
 /// Whether to ask an askpass program instead of the terminal or stdin.
 fn use_askpass(
     display: Option<&std::ffi::OsStr>,
     require: Option<&std::ffi::OsStr>,
     stdin_is_terminal: bool,
 ) -> bool {
-    let mut allowed = display.is_some_and(|d| !d.is_empty());
-    let mut used = false;
-    match require
-        .map(|r| r.to_string_lossy().to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("force") => {
-            allowed = true;
-            used = true;
-        }
-        Some("prefer") => used = allowed,
-        Some("never") => allowed = false,
-        _ => {}
-    }
-    if !stdin_is_terminal {
-        used = true;
-    }
-    used && allowed
+    let (allowed, preferred) = askpass_rules(display, require);
+    allowed && (preferred || !stdin_is_terminal)
 }
 
 fn stdin_is_terminal() -> bool {

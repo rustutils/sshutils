@@ -164,7 +164,12 @@ fn run(args: Args) -> Result<ExitCode, Failure> {
             .map_err(|e| (1, format!("ssh-agent: {}", io_message(&e))))?,
         (None, None) => unreachable!("either activated or bound"),
     };
-    let store = Store::new(default_lifetime);
+    let fingerprint_hash = args
+        .fingerprint_hash
+        .as_deref()
+        .and_then(keyfmt::parse_hash_alg)
+        .unwrap_or(keyfmt::FingerprintHash::Sha256);
+    let store = Store::new(default_lifetime, fingerprint_hash);
 
     if foreground {
         let options = Options {

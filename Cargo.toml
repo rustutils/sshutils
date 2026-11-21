@@ -17,6 +17,7 @@ sshutils-testing = { path = "crates/sshutils-testing" }
 russh = { version = "0.65.2", path = "vendor/russh/russh" }
 clap = { version = "4.6.9", features = ["derive"] }
 base64ct = { version = "1.8.3", features = ["alloc"] }
+bcrypt-pbkdf = "0.11.0"
 hmac = "0.13.0"
 md5 = "0.8.1"
 sha1 = "0.11.0"

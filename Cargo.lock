@@ -1679,6 +1679,7 @@ dependencies = [
 name = "ssh-agent"
 version = "0.1.0"
 dependencies = [
+ "bcrypt-pbkdf",
  "clap",
  "libc",
  "russh",
