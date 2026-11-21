@@ -21,7 +21,10 @@ pub fn current_user() -> Option<User> {
         }
         let name = CStr::from_ptr((*pw).pw_name).to_string_lossy().into_owned();
         let home = CStr::from_ptr((*pw).pw_dir).to_string_lossy().into_owned();
-        Some(User { name, home: PathBuf::from(home) })
+        Some(User {
+            name,
+            home: PathBuf::from(home),
+        })
     }
 }
 
@@ -50,10 +53,10 @@ pub fn expand_tilde(path: &str) -> PathBuf {
     if path == "~" {
         return ssh_dir().parent().map(PathBuf::from).unwrap_or_default();
     }
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = ssh_dir().parent() {
-            return home.join(rest);
-        }
+    if let Some(rest) = path.strip_prefix("~/")
+        && let Some(home) = ssh_dir().parent()
+    {
+        return home.join(rest);
     }
     PathBuf::from(path)
 }

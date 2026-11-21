@@ -96,8 +96,16 @@ fn drunken_bishop(digest: &[u8], header: &str, footer: &str) -> String {
     for byte in digest {
         let mut b = *byte;
         for _ in 0..4 {
-            x = if b & 1 != 0 { (x + 1).min(W - 1) } else { x.saturating_sub(1) };
-            y = if b & 2 != 0 { (y + 1).min(H - 1) } else { y.saturating_sub(1) };
+            x = if b & 1 != 0 {
+                (x + 1).min(W - 1)
+            } else {
+                x.saturating_sub(1)
+            };
+            y = if b & 2 != 0 {
+                (y + 1).min(H - 1)
+            } else {
+                y.saturating_sub(1)
+            };
             let len = SYMBOLS.len() as u8 - 2;
             if field[x][y] < len - 1 {
                 field[x][y] += 1;
@@ -111,7 +119,12 @@ fn drunken_bishop(digest: &[u8], header: &str, footer: &str) -> String {
 
     let border = |label: &str| {
         let pad = W.saturating_sub(label.len());
-        format!("+{}{}{}+", "-".repeat(pad / 2), label, "-".repeat(pad - pad / 2))
+        format!(
+            "+{}{}{}+",
+            "-".repeat(pad / 2),
+            label,
+            "-".repeat(pad - pad / 2)
+        )
     };
     let mut out = border(header);
     out.push('\n');

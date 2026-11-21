@@ -4,9 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
 
 [dependencies]
-libc = "0.2.191"
-rpassword = "7.5.5"
+libc.workspace = true
+rpassword.workspace = true
 russh.workspace = true
-thiserror.workspace = true

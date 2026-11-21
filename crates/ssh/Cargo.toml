@@ -4,9 +4,5 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
 
-[dependencies]
-sshutils-core.workspace = true
-russh.workspace = true
-anyhow.workspace = true
-tokio.workspace = true
