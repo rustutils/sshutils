@@ -1,23 +1,23 @@
 //! Key generation: `ssh-keygen [-q] [-a rounds] [-b bits] [-C comment]
 //! [-f file] [-N passphrase] [-t type] [-Z cipher]`.
 
-use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use russh::keys::key::safe_rng;
 use russh::keys::ssh_key::private::{EcdsaKeypair, Ed25519Keypair, KeypairData, RsaKeypair};
 use russh::keys::ssh_key::rand_core::Rng;
 use russh::keys::ssh_key::{Cipher, EcdsaCurve, Kdf, LineEnding, PrivateKey};
 use sshutils_core::keyfmt::{self, FingerprintHash};
-use sshutils_core::{paths, tty};
+use sshutils_core::{keyfile, paths, tty};
 
 use crate::args::Args;
+use crate::common;
 use crate::error::{Error, Result};
 
-const DEFAULT_TYPE: &str = "ed25519";
+pub(crate) const DEFAULT_TYPE: &str = "ed25519";
 const DEFAULT_RSA_BITS: u32 = 3072;
 const MIN_RSA_BITS: u32 = 1024;
 const MAX_RSA_BITS: u32 = 16384;
@@ -25,7 +25,7 @@ const DEFAULT_ROUNDS: u32 = 16;
 
 /// Key types we can generate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum KeyType {
+pub(crate) enum KeyType {
     Rsa,
     /// ECDSA; the curve is fixed if the full algorithm name was given.
     Ecdsa(Option<EcdsaCurve>),
@@ -35,7 +35,7 @@ enum KeyType {
 impl KeyType {
     /// Parse a `-t` argument. Accepts the short names and full algorithm
     /// names, case-insensitively, like OpenSSH.
-    fn parse(name: &str) -> Result<Self> {
+    pub(crate) fn parse(name: &str) -> Result<Self> {
         let key_type = match name.to_ascii_lowercase().as_str() {
             "rsa" | "ssh-rsa" => KeyType::Rsa,
             "ecdsa" => KeyType::Ecdsa(None),
@@ -62,7 +62,7 @@ impl KeyType {
     }
 
     /// Default file name in `~/.ssh`.
-    fn default_file_name(self) -> &'static str {
+    pub(crate) fn default_file_name(self) -> &'static str {
         match self {
             KeyType::Rsa => "id_rsa",
             KeyType::Ecdsa(_) => "id_ecdsa",
@@ -136,11 +136,7 @@ impl Plan {
             },
         };
 
-        let hash = match args.fingerprint_hash.as_deref() {
-            None => FingerprintHash::Sha256,
-            Some(name) => keyfmt::parse_hash_alg(name)
-                .ok_or_else(|| Error::fatal(format!("Invalid hash algorithm \"{name}\"")))?,
-        };
+        let hash = common::fingerprint_hash(args)?;
 
         Ok(Plan {
             type_name,
@@ -194,7 +190,7 @@ pub fn run(args: &Args) -> Result<()> {
 
     let path = match &args.file {
         Some(path) => path.clone(),
-        None => ask_filename(plan.key_type)?,
+        None => common::ask_filename("Enter file in which to save the key", plan.key_type)?,
     };
     create_ssh_dir_if_needed(&path, args.quiet)?;
     confirm_overwrite(&path)?;
@@ -212,7 +208,7 @@ pub fn run(args: &Args) -> Result<()> {
         encrypt(&key, &passphrase, plan.cipher, plan.rounds)?
     };
     save_private(&to_save, &path)?;
-    let pub_path = public_path(&path);
+    let pub_path = keyfile::public_path(&path);
     save_public(&key, &pub_path)?;
 
     if !args.quiet {
@@ -225,21 +221,6 @@ pub fn run(args: &Args) -> Result<()> {
         println!("{}", keyfmt::randomart(public, plan.hash));
     }
     Ok(())
-}
-
-/// Ask where to save the key, offering `~/.ssh/<default>`.
-fn ask_filename(key_type: KeyType) -> Result<PathBuf> {
-    let default = paths::ssh_dir().join(key_type.default_file_name());
-    let answer = tty::prompt_line(&format!(
-        "Enter file in which to save the key ({}): ",
-        default.display()
-    ))
-    .map_err(|_| Error::Exit(1))?;
-    Ok(if answer.is_empty() {
-        default
-    } else {
-        PathBuf::from(answer)
-    })
 }
 
 /// If the key goes into a missing `~/.ssh`, create it (mode 0700).
@@ -301,13 +282,6 @@ fn encrypt(key: &PrivateKey, passphrase: &str, cipher: Cipher, rounds: u32) -> R
         .map_err(|e| Error::fatal(format!("encrypting key failed: {e}")))
 }
 
-/// `<path>.pub`
-fn public_path(path: &Path) -> PathBuf {
-    let mut pub_path = OsString::from(path.as_os_str());
-    pub_path.push(".pub");
-    PathBuf::from(pub_path)
-}
-
 fn save_private(key: &PrivateKey, path: &Path) -> Result<()> {
     let failed = |e: &dyn std::fmt::Display| {
         Error::fatal(format!("Saving key \"{}\" failed: {e}", path.display()))
@@ -326,7 +300,12 @@ fn save_public(key: &PrivateKey, path: &Path) -> Result<()> {
             path.display()
         ))
     };
-    let line = key.public_key().to_openssh().map_err(|e| failed(&e))?;
+    // OpenSSH always writes the separator before the comment, even when the
+    // comment is empty.
+    let mut line = key.public_key().to_openssh().map_err(|e| failed(&e))?;
+    if key.comment().is_empty() {
+        line.push(' ');
+    }
     write_file(path, format!("{line}\n").as_bytes(), 0o644).map_err(|e| failed(&e))
 }
 
@@ -354,10 +333,5 @@ mod tests {
         );
         assert!(KeyType::parse("dsa").is_err());
         assert!(KeyType::parse("ed25519-sk").is_err());
-    }
-
-    #[test]
-    fn public_path_appends_suffix() {
-        assert_eq!(public_path(Path::new("dir/key")), Path::new("dir/key.pub"));
     }
 }

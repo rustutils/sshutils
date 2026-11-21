@@ -280,3 +280,19 @@ fn generated_key_logs_in_to_openssh_server() {
     );
     assert_eq!(out.stdout, "ok\n");
 }
+
+#[test]
+fn empty_comment_keeps_separator_in_public_key_file() {
+    let openssh = require_openssh!();
+    let c = keygen(&openssh)
+        .case(["-q", "-N", "", "-C", "", "-f", "key"])
+        .run();
+    c.assert_same_outcome();
+    let shape = |run: &sshutils_testing::Run| {
+        let line = fs::read_to_string(run.path("key.pub")).unwrap();
+        let (algorithm, rest) = line.split_once(' ').unwrap();
+        let (_, tail) = rest.split_once(' ').unwrap_or((rest, "<none>"));
+        format!("{algorithm} <key> [{tail}]")
+    };
+    assert_eq!(shape(&c.ours), shape(&c.theirs));
+}

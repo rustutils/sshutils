@@ -9,16 +9,23 @@ pub fn read_passphrase(prompt: &str) -> io::Result<String> {
         Ok(p) => Ok(p),
         Err(_) => {
             eprint!("{prompt}");
-            read_line()
+            // Like OpenSSH, end of input means an empty passphrase.
+            match read_line() {
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(String::new()),
+                result => result,
+            }
         }
     }
 }
 
-/// Read one line from stdin (with echo), stripping the newline.
+/// Read one line from stdin (with echo), stripping the newline. Fails with
+/// `UnexpectedEof` if stdin is already at end of input.
 pub fn read_line() -> io::Result<String> {
     io::stdout().flush()?;
     let mut line = String::new();
-    io::stdin().lock().read_line(&mut line)?;
+    if io::stdin().lock().read_line(&mut line)? == 0 {
+        return Err(io::ErrorKind::UnexpectedEof.into());
+    }
     while line.ends_with(['\n', '\r']) {
         line.pop();
     }

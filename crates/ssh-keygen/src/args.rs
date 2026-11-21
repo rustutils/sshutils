@@ -189,6 +189,8 @@ pub struct Args {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Generate,
+    Fingerprint,
+    PrintPublic,
     /// A mode that isn't implemented yet, named by its option letter.
     Unimplemented(char),
 }
@@ -199,30 +201,38 @@ impl Args {
     /// approximate; each mode's position must be verified against OpenSSH
     /// when that mode is implemented.
     pub fn mode(&self) -> Mode {
-        let unimplemented = [
-            (self.signature.is_some(), 'Y'),
-            (self.moduli.is_some(), 'M'),
-            (self.krl, 'k'),
-            (self.query_krl, 'Q'),
-            (self.find_host.is_some() || self.remove_host.is_some(), 'F'),
-            (self.identity.is_some() && self.ca_key.is_some(), 's'),
-            (self.show_certificate, 'L'),
-            (self.fingerprint, 'l'),
-            (self.change_passphrase, 'p'),
-            (self.change_comment, 'c'),
-            (self.export, 'e'),
-            (self.import, 'i'),
-            (self.print_public, 'y'),
-            (self.bubblebabble, 'B'),
-            (self.sshfp.is_some(), 'r'),
-            (self.hash_known_hosts, 'H'),
-            (self.pkcs11.is_some(), 'D'),
-            (self.download_resident, 'K'),
-            (self.all_host_keys, 'A'),
+        use Mode::{Fingerprint, PrintPublic, Unimplemented};
+        let modes = [
+            (self.signature.is_some(), Unimplemented('Y')),
+            (self.moduli.is_some(), Unimplemented('M')),
+            (self.krl, Unimplemented('k')),
+            (self.query_krl, Unimplemented('Q')),
+            // `-F host -l` searches known_hosts and prints fingerprints.
+            (
+                self.find_host.is_some() || self.remove_host.is_some(),
+                Unimplemented('F'),
+            ),
+            (
+                self.identity.is_some() && self.ca_key.is_some(),
+                Unimplemented('s'),
+            ),
+            (self.show_certificate, Unimplemented('L')),
+            (self.fingerprint, Fingerprint),
+            (self.change_passphrase, Unimplemented('p')),
+            (self.change_comment, Unimplemented('c')),
+            (self.export, Unimplemented('e')),
+            (self.import, Unimplemented('i')),
+            (self.print_public, PrintPublic),
+            (self.bubblebabble, Unimplemented('B')),
+            (self.sshfp.is_some(), Unimplemented('r')),
+            (self.hash_known_hosts, Unimplemented('H')),
+            (self.pkcs11.is_some(), Unimplemented('D')),
+            (self.download_resident, Unimplemented('K')),
+            (self.all_host_keys, Unimplemented('A')),
         ];
-        unimplemented
-            .iter()
+        modes
+            .into_iter()
             .find(|(selected, _)| *selected)
-            .map_or(Mode::Generate, |&(_, letter)| Mode::Unimplemented(letter))
+            .map_or(Mode::Generate, |(_, mode)| mode)
     }
 }

@@ -5,6 +5,7 @@
 //! here so the binaries stay thin.
 
 pub mod cli;
+pub mod keyfile;
 pub mod keyfmt;
 pub mod paths;
 pub mod tty;
