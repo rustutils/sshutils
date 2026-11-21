@@ -1654,6 +1654,18 @@ name = "ssh"
 version = "0.1.0"
 
 [[package]]
+name = "ssh-add"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "russh",
+ "sshutils-core",
+ "sshutils-testing",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "ssh-cipher"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

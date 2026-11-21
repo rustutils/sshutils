@@ -9,6 +9,7 @@ pub mod keyfile;
 pub mod keyfmt;
 pub mod known_hosts;
 pub mod paths;
+pub mod time;
 pub mod tty;
 
 pub use russh::keys::ssh_key;

@@ -1,0 +1,17 @@
+[package]
+name = "ssh-add"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+clap.workspace = true
+russh.workspace = true
+sshutils-core.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+sshutils-testing.workspace = true
+tempfile.workspace = true
