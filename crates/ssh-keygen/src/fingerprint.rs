@@ -82,9 +82,7 @@ fn fingerprint_private(path: &Path, show: impl Fn(&KeyData, Option<&str>)) -> Re
     if let Ok(key) = keyfile::load_private(path, None) {
         // Only OpenSSH's own format stores a comment; for PEM and PKCS#8
         // keys OpenSSH shows "no comment" rather than an empty one.
-        let has_comment = std::fs::read_to_string(path)
-            .is_ok_and(|text| text.contains("BEGIN OPENSSH PRIVATE KEY"));
-        let comment = has_comment.then(|| key.comment().as_str_lossy());
+        let comment = common::has_comment_field(path).then(|| key.comment().as_str_lossy());
         show(key.public_key().key_data(), comment);
         return Ok(());
     }

@@ -1,27 +1,25 @@
 //! Key generation: `ssh-keygen [-q] [-a rounds] [-b bits] [-C comment]
 //! [-f file] [-N passphrase] [-t type] [-Z cipher]`.
 
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::fs;
+use std::os::unix::fs::DirBuilderExt;
 use std::path::Path;
 
 use russh::keys::key::safe_rng;
 use russh::keys::ssh_key::private::{EcdsaKeypair, Ed25519Keypair, KeypairData, RsaKeypair};
-use russh::keys::ssh_key::rand_core::Rng;
-use russh::keys::ssh_key::{Cipher, EcdsaCurve, Kdf, LineEnding, PrivateKey};
+use russh::keys::ssh_key::{EcdsaCurve, PrivateKey};
 use sshutils_core::keyfmt::{self, FingerprintHash};
 use sshutils_core::{keyfile, paths, tty};
 
 use crate::args::Args;
 use crate::common;
 use crate::error::{Error, Result};
+use crate::save::{self, Encryption};
 
 pub(crate) const DEFAULT_TYPE: &str = "ed25519";
 const DEFAULT_RSA_BITS: u32 = 3072;
 const MIN_RSA_BITS: u32 = 1024;
 const MAX_RSA_BITS: u32 = 16384;
-const DEFAULT_ROUNDS: u32 = 16;
 
 /// Key types we can generate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,8 +76,7 @@ struct Plan {
     key_type: KeyType,
     rsa_bits: u32,
     curve: EcdsaCurve,
-    rounds: u32,
-    cipher: Cipher,
+    encryption: Encryption,
     hash: FingerprintHash,
 }
 
@@ -91,7 +88,7 @@ impl Plan {
         let bits = args
             .bits
             .as_deref()
-            .map(|b| parse_positive(b, "Bits"))
+            .map(|b| common::parse_positive(b, "Bits"))
             .transpose()?;
 
         let rsa_bits = bits.unwrap_or(DEFAULT_RSA_BITS);
@@ -121,20 +118,7 @@ impl Plan {
             _ => EcdsaCurve::NistP256,
         };
 
-        let rounds = args
-            .rounds
-            .as_deref()
-            .map(|r| parse_positive(r, "Invalid number of rounds"))
-            .transpose()?
-            .unwrap_or(DEFAULT_ROUNDS);
-
-        let cipher = match args.cipher.as_deref() {
-            None => Cipher::Aes256Ctr,
-            Some(name) => match Cipher::new(name) {
-                Ok(cipher) if cipher != Cipher::None => cipher,
-                _ => return Err(Error::fatal(format!("unknown cipher {name}"))),
-            },
-        };
+        let encryption = Encryption::from_args(args)?;
 
         let hash = common::fingerprint_hash(args)?;
 
@@ -143,8 +127,7 @@ impl Plan {
             key_type,
             rsa_bits,
             curve,
-            rounds,
-            cipher,
+            encryption,
             hash,
         })
     }
@@ -164,19 +147,6 @@ impl Plan {
         };
         PrivateKey::new(keypair, "")
             .map_err(|e| Error::fatal(format!("key generation failed: {e}")))
-    }
-}
-
-/// Parse a positive integer option value.
-fn parse_positive(value: &str, what: &str) -> Result<u32> {
-    match value.parse::<u32>() {
-        Ok(0) => Err(Error::fatal(format!(
-            "{what} has bad value {value} (too small)"
-        ))),
-        Ok(n) => Ok(n),
-        Err(_) => Err(Error::fatal(format!(
-            "{what} has bad value {value} (invalid)"
-        ))),
     }
 }
 
@@ -202,14 +172,9 @@ pub fn run(args: &Args) -> Result<()> {
     let comment = args.comment.clone().unwrap_or_else(paths::default_comment);
     key.set_comment(comment.as_str());
 
-    let to_save = if passphrase.is_empty() {
-        key.clone()
-    } else {
-        encrypt(&key, &passphrase, plan.cipher, plan.rounds)?
-    };
-    save_private(&to_save, &path)?;
+    save::save_private(&key, &path, &passphrase, &plan.encryption)?;
     let pub_path = keyfile::public_path(&path);
-    save_public(&key, &pub_path)?;
+    save::save_public(&key, &pub_path)?;
 
     if !args.quiet {
         let public = key.public_key().key_data();
@@ -271,52 +236,6 @@ fn ask_new_passphrase(path: &Path) -> Result<String> {
         }
         println!("Passphrases do not match.  Try again.");
     }
-}
-
-fn encrypt(key: &PrivateKey, passphrase: &str, cipher: Cipher, rounds: u32) -> Result<PrivateKey> {
-    let mut rng = safe_rng();
-    let mut salt = vec![0u8; 16];
-    rng.fill_bytes(&mut salt);
-    let kdf = Kdf::Bcrypt { salt, rounds };
-    key.encrypt_with(cipher, kdf, rng.next_u32(), passphrase)
-        .map_err(|e| Error::fatal(format!("encrypting key failed: {e}")))
-}
-
-fn save_private(key: &PrivateKey, path: &Path) -> Result<()> {
-    let failed = |e: &dyn std::fmt::Display| {
-        Error::fatal(format!("Saving key \"{}\" failed: {e}", path.display()))
-    };
-    let pem = key.to_openssh(LineEnding::LF).map_err(|e| failed(&e))?;
-    write_file(path, pem.as_bytes(), 0o600).map_err(|e| failed(&e))?;
-    // An existing file keeps its old mode when truncated; never leave a
-    // private key readable by others.
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|e| failed(&e))
-}
-
-fn save_public(key: &PrivateKey, path: &Path) -> Result<()> {
-    let failed = |e: &dyn std::fmt::Display| {
-        Error::fatal(format!(
-            "Unable to save public key to {}: {e}",
-            path.display()
-        ))
-    };
-    // OpenSSH always writes the separator before the comment, even when the
-    // comment is empty.
-    let mut line = key.public_key().to_openssh().map_err(|e| failed(&e))?;
-    if key.comment().is_empty() {
-        line.push(' ');
-    }
-    write_file(path, format!("{line}\n").as_bytes(), 0o644).map_err(|e| failed(&e))
-}
-
-fn write_file(path: &Path, contents: &[u8], mode: u32) -> std::io::Result<()> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(mode)
-        .open(path)?;
-    file.write_all(contents)
 }
 
 #[cfg(test)]

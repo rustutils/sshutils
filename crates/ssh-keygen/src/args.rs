@@ -126,6 +126,12 @@ pub struct Args {
     /// Key file.
     #[arg(short = 'f', value_name = "filename")]
     pub file: Option<PathBuf>,
+    /// Obsolete; accepted and ignored, as by OpenSSH.
+    #[arg(short = 'o', hide = true)]
+    pub obsolete_new_format: bool,
+    /// Accepted by OpenSSH's option parser; treated like `-i`.
+    #[arg(short = 'X', hide = true)]
+    pub import_legacy: bool,
     /// Generic DNS record format (with `-r`).
     #[arg(short = 'g')]
     pub generic_dns: bool,
@@ -191,6 +197,8 @@ pub enum Mode {
     Generate,
     Fingerprint,
     PrintPublic,
+    ChangePassphrase,
+    ChangeComment,
     /// A mode that isn't implemented yet, named by its option letter.
     Unimplemented(char),
 }
@@ -201,7 +209,7 @@ impl Args {
     /// approximate; each mode's position must be verified against OpenSSH
     /// when that mode is implemented.
     pub fn mode(&self) -> Mode {
-        use Mode::{Fingerprint, PrintPublic, Unimplemented};
+        use Mode::{ChangeComment, ChangePassphrase, Fingerprint, PrintPublic, Unimplemented};
         let modes = [
             (self.signature.is_some(), Unimplemented('Y')),
             (self.moduli.is_some(), Unimplemented('M')),
@@ -218,10 +226,10 @@ impl Args {
             ),
             (self.show_certificate, Unimplemented('L')),
             (self.fingerprint, Fingerprint),
-            (self.change_passphrase, Unimplemented('p')),
-            (self.change_comment, Unimplemented('c')),
+            (self.change_passphrase, ChangePassphrase),
+            (self.change_comment, ChangeComment),
             (self.export, Unimplemented('e')),
-            (self.import, Unimplemented('i')),
+            (self.import || self.import_legacy, Unimplemented('i')),
             (self.print_public, PrintPublic),
             (self.bubblebabble, Unimplemented('B')),
             (self.sshfp.is_some(), Unimplemented('r')),

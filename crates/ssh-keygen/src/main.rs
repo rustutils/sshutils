@@ -1,9 +1,12 @@
 mod args;
+mod comment;
 mod common;
 mod error;
 mod fingerprint;
 mod generate;
+mod passphrase;
 mod public;
+mod save;
 
 use std::process::ExitCode;
 
@@ -16,6 +19,8 @@ fn main() -> ExitCode {
         Mode::Generate => generate::run(&args),
         Mode::Fingerprint => fingerprint::run(&args),
         Mode::PrintPublic => public::run(&args),
+        Mode::ChangePassphrase => passphrase::run(&args),
+        Mode::ChangeComment => comment::run(&args),
         Mode::Unimplemented(letter) => {
             Err(Error::fatal(format!("-{letter} is not implemented yet")))
         }
