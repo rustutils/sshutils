@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 base64ct.workspace = true
 clap.workspace = true
+hmac.workspace = true
 libc.workspace = true
 md5.workspace = true
 rpassword.workspace = true

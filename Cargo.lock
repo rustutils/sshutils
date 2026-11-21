@@ -1737,6 +1737,7 @@ version = "0.1.0"
 dependencies = [
  "base64ct",
  "clap",
+ "hmac",
  "libc",
  "md5",
  "rpassword",

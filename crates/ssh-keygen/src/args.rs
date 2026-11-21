@@ -199,6 +199,9 @@ pub enum Mode {
     PrintPublic,
     ChangePassphrase,
     ChangeComment,
+    FindHost,
+    RemoveHost,
+    HashKnownHosts,
     /// A mode that isn't implemented yet, named by its option letter.
     Unimplemented(char),
 }
@@ -209,17 +212,18 @@ impl Args {
     /// approximate; each mode's position must be verified against OpenSSH
     /// when that mode is implemented.
     pub fn mode(&self) -> Mode {
-        use Mode::{ChangeComment, ChangePassphrase, Fingerprint, PrintPublic, Unimplemented};
+        use Mode::{
+            ChangeComment, ChangePassphrase, FindHost, Fingerprint, HashKnownHosts, PrintPublic,
+            RemoveHost, Unimplemented,
+        };
         let modes = [
             (self.signature.is_some(), Unimplemented('Y')),
             (self.moduli.is_some(), Unimplemented('M')),
             (self.krl, Unimplemented('k')),
             (self.query_krl, Unimplemented('Q')),
-            // `-F host -l` searches known_hosts and prints fingerprints.
-            (
-                self.find_host.is_some() || self.remove_host.is_some(),
-                Unimplemented('F'),
-            ),
+            // `-R` wins over `-F`; `-F host -l` prints fingerprints.
+            (self.remove_host.is_some(), RemoveHost),
+            (self.find_host.is_some(), FindHost),
             (
                 self.identity.is_some() && self.ca_key.is_some(),
                 Unimplemented('s'),
@@ -233,7 +237,7 @@ impl Args {
             (self.print_public, PrintPublic),
             (self.bubblebabble, Unimplemented('B')),
             (self.sshfp.is_some(), Unimplemented('r')),
-            (self.hash_known_hosts, Unimplemented('H')),
+            (self.hash_known_hosts, HashKnownHosts),
             (self.pkcs11.is_some(), Unimplemented('D')),
             (self.download_resident, Unimplemented('K')),
             (self.all_host_keys, Unimplemented('A')),
