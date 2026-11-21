@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# Vendored dependencies (git submodules) have their own workspaces.
+exclude = ["vendor"]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,7 +14,7 @@ repository = "https://github.com/rustutils/sshutils"
 [workspace.dependencies]
 sshutils-core = { path = "crates/sshutils-core", version = "0.1.0" }
 sshutils-testing = { path = "crates/sshutils-testing" }
-russh = "0.65.2"
+russh = { version = "0.65.2", path = "vendor/russh/russh" }
 clap = { version = "4.6.9", features = ["derive"] }
 base64ct = { version = "1.8.3", features = ["alloc"] }
 hmac = "0.13.0"
