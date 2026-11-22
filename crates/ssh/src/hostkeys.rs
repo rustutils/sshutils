@@ -2,8 +2,7 @@
 //! host key algorithms that follows from it, and the decision whether to
 //! trust the key the server presents (OpenSSH's `check_host_key`).
 //!
-//! Host certificates, `RevokedHostKeys`, `VerifyHostKeyDNS` and
-//! `KnownHostsCommand` are not supported yet.
+//! `VerifyHostKeyDNS` and `KnownHostsCommand` are not supported yet.
 
 use std::net::SocketAddr;
 
@@ -16,6 +15,7 @@ use sshutils_config::matching::{match_pattern, match_pattern_list};
 use sshutils_config::values::*;
 use sshutils_core::keyfmt::{self, FingerprintHash};
 use sshutils_core::known_hosts::{Line, Marker};
+use sshutils_core::krl;
 
 use crate::connect::DEFAULT_PORT;
 use crate::log;
@@ -369,6 +369,39 @@ impl Verifier<'_> {
                         self.peer.port()
                     ));
                     std::process::exit(255);
+                }
+            }
+        }
+        let certificate = match key {
+            HostKey::Certificate(certificate) => Some(&**certificate),
+            HostKey::Plain(_) => None,
+        };
+        let files: Vec<String> = self
+            .options
+            .revoked_host_keys
+            .iter()
+            .map(|f| expand_tilde(f).unwrap_or_else(|_| f.clone()))
+            .collect();
+        for file in &files {
+            match revoked_by_file(file, key.key_data(), certificate) {
+                Ok(false) => {}
+                Ok(true) => {
+                    log::error(&format!(
+                        "Host key {} {fingerprint} revoked by file {file}",
+                        key.label()
+                    ));
+                    return false;
+                }
+                Err(err) => {
+                    if let Some(detail) = &err.detail {
+                        log::error(detail);
+                    }
+                    log::error(&format!(
+                        "Error checking host key {} {fingerprint} in revoked keys file {file}: {}",
+                        key.label(),
+                        err.reason
+                    ));
+                    return false;
                 }
             }
         }
@@ -809,6 +842,24 @@ impl Verifier<'_> {
         }
         true
     }
+}
+
+/// Whether a `RevokedHostKeys` file (a KRL or a list of keys) revokes the
+/// key (`sshkey_check_revoked`).
+fn revoked_by_file(
+    file: &str,
+    key: &KeyData,
+    certificate: Option<&Certificate>,
+) -> Result<bool, krl::Error> {
+    let data = std::fs::read(file).map_err(|err| krl::Error {
+        detail: None,
+        reason: crate::io_message(&err),
+    })?;
+    if krl::is_krl(&data) {
+        log::debug2(&format!("ssh_krl_file_contains_key: checking KRL {file}"));
+        return Ok(krl::Krl::parse(&data)?.is_revoked(key, certificate));
+    }
+    krl::key_list_contains(&String::from_utf8_lossy(&data), key, certificate)
 }
 
 /// Most other names listed for a key.

@@ -8,6 +8,7 @@ pub mod cli;
 pub mod keyfile;
 pub mod keyfmt;
 pub mod known_hosts;
+pub mod krl;
 pub mod paths;
 pub mod time;
 pub mod tty;
