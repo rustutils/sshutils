@@ -41,21 +41,41 @@ pub struct Sshd {
 }
 
 impl Sshd {
-    /// Generate keys and configuration and start the server. Panics if it
-    /// doesn't come up.
+    /// Generate keys and configuration and start the server with an
+    /// Ed25519 host key. Panics if it doesn't come up.
     pub fn start(openssh: &Openssh) -> Sshd {
+        Sshd::start_with_host_keys(openssh, &["ed25519"])
+    }
+
+    /// Like [`start`](Self::start), with a host key of each of these types
+    /// (`ssh-keygen -t` names), offered in this order. The first is
+    /// [`host_key_pub`](Self::host_key_pub); all are in
+    /// [`host_key_pub_of`](Self::host_key_pub_of).
+    pub fn start_with_host_keys(openssh: &Openssh, types: &[&str]) -> Sshd {
         let dir = tempfile::tempdir().expect("create sshd directory");
         let keygen = openssh.require_tool("ssh-keygen");
-        for key in ["host_key", "user_key"] {
+        let generate = |key: &str, key_type: &str| {
             let out = process::run(
                 process::command(&keygen, dir.path())
-                    .args(["-q", "-t", "ed25519", "-N", "", "-C"])
+                    .args(["-q", "-t", key_type, "-N", "", "-C"])
                     .arg(key)
                     .arg("-f")
                     .arg(key),
                 b"",
             );
             assert_eq!(out.status, Some(0), "ssh-keygen failed: {}", out.stderr);
+        };
+        generate("user_key", "ed25519");
+        let first = types.first().expect("at least one host key type");
+        for key_type in types {
+            generate(&format!("host_key_{key_type}"), key_type);
+        }
+        for suffix in ["", ".pub"] {
+            std::fs::copy(
+                dir.path().join(format!("host_key_{first}{suffix}")),
+                dir.path().join(format!("host_key{suffix}")),
+            )
+            .expect("copy the first host key");
         }
         std::fs::copy(
             dir.path().join("user_key.pub"),
@@ -68,7 +88,7 @@ impl Sshd {
         let mut last_log = String::new();
         for _ in 0..5 {
             let port = free_port();
-            write_configs(openssh, dir.path(), port);
+            write_configs(openssh, dir.path(), port, types);
             match spawn(openssh, dir.path()) {
                 Ok((child, log)) => {
                     return Sshd {
@@ -98,9 +118,14 @@ impl Sshd {
         self.dir.path().join("user_key")
     }
 
-    /// The server's public host key.
+    /// The server's (first) public host key.
     pub fn host_key_pub(&self) -> PathBuf {
         self.dir.path().join("host_key.pub")
+    }
+
+    /// The server's public host key of this type.
+    pub fn host_key_pub_of(&self, key_type: &str) -> PathBuf {
+        self.dir.path().join(format!("host_key_{key_type}.pub"))
     }
 
     /// `known_hosts` file containing the server's host key.
@@ -133,11 +158,15 @@ fn free_port() -> u16 {
         .port()
 }
 
-fn write_configs(openssh: &Openssh, dir: &Path, port: u16) {
+fn write_configs(openssh: &Openssh, dir: &Path, port: u16, types: &[&str]) {
     let d = dir.display();
+    let host_keys: String = types
+        .iter()
+        .map(|t| format!("HostKey {d}/host_key_{t}\n"))
+        .collect();
     let mut sshd_config = format!(
         "ListenAddress 127.0.0.1:{port}\n\
-         HostKey {d}/host_key\n\
+         {host_keys}\
          PidFile none\n\
          AuthorizedKeysFile {d}/authorized_keys\n\
          StrictModes no\n\

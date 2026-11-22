@@ -1,15 +1,19 @@
 //! `ssh`: the OpenSSH remote login client.
 //!
-//! So far this reads the command line and the configuration, `-G` prints
-//! the result and `-Q` lists the supported algorithms. Connecting comes
-//! next.
+//! So far this reads the command line and the configuration (`-G` prints
+//! the result, `-Q` lists the supported algorithms), connects, and checks
+//! the server's host key. Authentication comes next.
 
 mod args;
+mod connect;
+mod hostkeys;
+mod log;
 mod query;
+mod transport;
 
 use std::ffi::OsString;
-use std::io::Write;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use args::{Arguments, Item, USAGE, UsageError};
 use sshutils_config::algorithms::{self, Kind};
@@ -30,8 +34,11 @@ enum Exit {
     /// A command-line error: the message (if any) and the usage text,
     /// status 255.
     Usage(String),
-    /// Print the message (if not empty) and exit with the status.
+    /// Print the message (if not empty) on stderr and exit with the
+    /// status.
     Message(u8, String),
+    /// OpenSSH's `fatal()`: log the message and exit with status 255.
+    Fatal(String),
     /// Print the text on stdout and exit successfully (`-Q`).
     Print(String),
 }
@@ -39,7 +46,12 @@ enum Exit {
 impl Exit {
     /// OpenSSH's `fatal()`: status 255.
     fn fatal(message: impl Into<String>) -> Self {
-        Exit::Message(255, message.into())
+        Exit::Fatal(message.into())
+    }
+
+    /// Exit with status 255 after the reason has been logged.
+    fn failed() -> Self {
+        Exit::Message(255, String::new())
     }
 }
 
@@ -52,31 +64,6 @@ impl From<UsageError> for Exit {
 impl From<sshutils_config::Fatal> for Exit {
     fn from(err: sshutils_config::Fatal) -> Self {
         Exit::fatal(err.0)
-    }
-}
-
-/// Where log messages go: stderr, a file (`-E`) or syslog (`-y`).
-enum Log {
-    Stderr,
-    File(std::fs::File),
-    Syslog,
-}
-
-impl Log {
-    fn error(&mut self, message: &str) {
-        match self {
-            Log::Stderr => eprintln!("{message}"),
-            Log::File(file) => {
-                let _ = writeln!(file, "{message}");
-            }
-            Log::Syslog => {
-                if let Ok(message) = std::ffi::CString::new(message) {
-                    // SAFETY: both strings are NUL-terminated, and the format
-                    // consumes exactly one string argument.
-                    unsafe { libc::syslog(libc::LOG_ERR, c"%s".as_ptr(), message.as_ptr()) };
-                }
-            }
-        }
     }
 }
 
@@ -95,8 +82,7 @@ struct Cli {
 }
 
 fn main() -> ExitCode {
-    let mut log = Log::Stderr;
-    match run(&mut log) {
+    match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(Exit::Usage(message)) => {
             if !message.is_empty() {
@@ -111,14 +97,18 @@ fn main() -> ExitCode {
         }
         Err(Exit::Message(status, message)) => {
             if !message.is_empty() {
-                log.error(&message);
+                eprintln!("{message}");
             }
             ExitCode::from(status)
+        }
+        Err(Exit::Fatal(message)) => {
+            log::fatal(&message);
+            ExitCode::from(255)
         }
     }
 }
 
-fn run(log: &mut Log) -> Result<(), Exit> {
+fn run() -> Result<(), Exit> {
     let mut argv = std::env::args_os();
     let argv0 = argv
         .next()
@@ -141,6 +131,7 @@ fn run(log: &mut Log) -> Result<(), Exit> {
     let Some(host) = cli.host.clone() else {
         return Err(Exit::Usage(String::new()));
     };
+    log::set_level(options.log_level.unwrap_or(LOG_LEVEL_INFO));
 
     if let Some(user) = &options.user
         && !valid_user(user)
@@ -172,11 +163,11 @@ fn run(log: &mut Log) -> Result<(), Exit> {
                     format!("Couldn't open logfile {path}: {}", io_message(&e)),
                 )
             })?;
-        *log = Log::File(file);
+        log::set_sink(log::Sink::File(file));
     } else if cli.use_syslog {
         // SAFETY: the identity is a static NUL-terminated string.
         unsafe { libc::openlog(c"ssh".as_ptr(), libc::LOG_PID, libc::LOG_USER) };
-        *log = Log::Syslog;
+        log::set_sink(log::Sink::Syslog);
     }
 
     let request = Request {
@@ -190,9 +181,10 @@ fn run(log: &mut Log) -> Result<(), Exit> {
     let mut warnings = Vec::new();
     let resolved = sshutils_config::resolve(options, &request, &mut warnings);
     for warning in &warnings {
-        log.error(warning);
+        log::error(warning);
     }
     let resolved = resolved?;
+    log::set_level(resolved.options.log_level.unwrap_or(LOG_LEVEL_INFO));
 
     if cli.config_test {
         print!("{}", resolved.options.dump(&resolved.host));
@@ -204,7 +196,43 @@ fn run(log: &mut Log) -> Result<(), Exit> {
     if cli.dump_pubkeys {
         return Err(Exit::fatal("-Z is not supported yet"));
     }
-    Err(Exit::fatal("connecting is not supported yet"))
+    connect(resolved)
+}
+
+/// Connect to the host and check its key (`ssh_connect` and `ssh_login`).
+fn connect(resolved: sshutils_config::Resolved) -> Result<(), Exit> {
+    if resolved.options.proxy_command.is_some() {
+        return Err(Exit::fatal(
+            "ProxyCommand and ProxyJump are not supported yet",
+        ));
+    }
+    let host = resolved.host;
+    let options = Arc::new(resolved.options);
+    let addresses = match resolved.addresses {
+        Some(addresses) => addresses,
+        None => connect::resolve(&host, &options).map_err(|()| Exit::failed())?,
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| Exit::fatal(format!("cannot start the event loop: {err}")))?;
+    runtime.block_on(async {
+        let connection = connect::connect(&host, &addresses, &options)
+            .await
+            .map_err(|()| Exit::failed())?;
+        let user = options.user.clone().unwrap_or_default();
+        let _transport = transport::establish(connection, &host, Arc::clone(&options))
+            .await
+            .map_err(|failure| match failure {
+                transport::Failure::HostKey => Exit::fatal("Host key verification failed."),
+                transport::Failure::Logged => Exit::failed(),
+            })?;
+        log::debug(&format!(
+            "Authenticating to {host}:{} as '{user}'",
+            connect::port(&options)
+        ));
+        Err(Exit::fatal("authentication is not supported yet"))
+    })
 }
 
 /// Take the destination: `ssh://[user@]host[:port]` or `[user@]host`.
@@ -463,7 +491,7 @@ fn apply_option(
 }
 
 /// An I/O error as `strerror` would describe it.
-fn io_message(err: &std::io::Error) -> String {
+pub(crate) fn io_message(err: &std::io::Error) -> String {
     let message = err.to_string();
     match message.find(" (os error ") {
         Some(i) => message[..i].to_string(),

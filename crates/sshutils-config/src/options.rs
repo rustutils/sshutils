@@ -137,6 +137,10 @@ pub struct Options {
     pub jump_extra: Option<String>,
     /// `-W host:port`.
     pub stdio_forward: Option<(String, i32)>,
+    /// Whether `KexAlgorithms` was configured (before the defaults were
+    /// filled in); OpenSSH only warns about key exchange without
+    /// post-quantum protection for its own defaults.
+    pub kex_algorithms_set: bool,
 }
 
 /// Default lifetime of `ObscureKeystrokeTiming` packets, in milliseconds.
@@ -300,6 +304,7 @@ impl Options {
             algorithms::ALL_MACS,
             "macs",
         )?);
+        self.kex_algorithms_set = self.kex_algorithms.is_some();
         self.kex_algorithms = Some(assemble(
             &self.kex_algorithms,
             algorithms::DEFAULT_KEX,

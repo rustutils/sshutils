@@ -157,9 +157,19 @@ unsafe fn sockaddr_address(sa: *const libc::sockaddr) -> Option<Address> {
 
 /// The IPv4 and IPv6 addresses of the interfaces that are up.
 pub fn local_addresses() -> std::io::Result<Vec<Address>> {
+    Ok(interface_addresses()?
+        .into_iter()
+        .map(|(_, address)| address)
+        .collect())
+}
+
+/// The IPv4 and IPv6 addresses of the interfaces that are up, with the
+/// interface names, in the system's order.
+pub fn interface_addresses() -> std::io::Result<Vec<(String, Address)>> {
     let mut addresses = Vec::new();
     // SAFETY: getifaddrs allocates a list that is only read while alive and
-    // then freed; each ifa_addr matches its family's size.
+    // then freed; each ifa_addr matches its family's size, and each name is
+    // a NUL-terminated string.
     unsafe {
         let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
         if libc::getifaddrs(&mut list) != 0 {
@@ -173,7 +183,10 @@ pub fn local_addresses() -> std::io::Result<Vec<Address>> {
                 continue;
             }
             if let Some(address) = sockaddr_address(ifa.ifa_addr) {
-                addresses.push(address);
+                let name = std::ffi::CStr::from_ptr(ifa.ifa_name)
+                    .to_string_lossy()
+                    .into_owned();
+                addresses.push((name, address));
             }
         }
         libc::freeifaddrs(list);
