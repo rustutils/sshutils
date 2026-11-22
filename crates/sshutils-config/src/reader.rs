@@ -9,6 +9,7 @@ use crate::forward::{parse_forward, parse_jump, split_host};
 use crate::keywords::{self, Opcode};
 use crate::lexer::{split_args, split_line};
 use crate::matching::{match_hostname, match_pattern, match_pattern_list};
+use crate::network::{local_addresses, parse_network_list};
 use crate::options::{Options, PermittedCname, set_once};
 use crate::values::*;
 
@@ -1187,10 +1188,23 @@ impl<'a> Reader<'a> {
                     }
                 }
                 "localnetwork" => {
-                    return Err(Fatal(format!(
-                        "{} line {}: Match localnetwork is not supported yet",
-                        origin.file, origin.line
-                    )));
+                    let networks = match parse_network_list(&value) {
+                        Ok(networks) => networks,
+                        Err(error) => {
+                            self.errors.push(error);
+                            return Ok(None);
+                        }
+                    };
+                    match local_addresses() {
+                        Ok(addresses) => addresses
+                            .iter()
+                            .any(|a| networks.iter().any(|n| n.contains(a))),
+                        Err(e) => {
+                            self.errors
+                                .push(format!("match localnetwork: getifaddrs failed: {e}"));
+                            false
+                        }
+                    }
                 }
                 _ => {
                     self.errors

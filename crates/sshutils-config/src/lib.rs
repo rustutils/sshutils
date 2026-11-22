@@ -14,6 +14,7 @@ pub mod forward;
 pub mod keywords;
 pub mod lexer;
 pub mod matching;
+pub mod network;
 pub mod options;
 pub mod reader;
 pub mod values;

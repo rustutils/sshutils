@@ -587,3 +587,37 @@ fn values_and_errors() {
         h.config(config, &["h"]);
     }
 }
+
+#[test]
+fn match_localnetwork() {
+    let openssh = require_openssh!();
+    if !recent(&openssh) {
+        return;
+    }
+    let h = Harness::new(&openssh);
+    // Every machine has the loopback addresses; 192.0.2.0/24 and
+    // 2001:db8::/32 are documentation ranges no interface uses.
+    for networks in [
+        "127.0.0.0/8",
+        "127.1/32",
+        "192.0.2.0/24",
+        "192.0.2.0/24,127.0.0.1",
+        "::1",
+        "::1/128,2001:db8::/32",
+        "2001:db8::/32",
+        "0.0.0.0/0",
+        // Errors.
+        "",
+        "127.0.0.1/8",
+        "127.0.0.0/33",
+        "127.0.0.0/",
+        "loopback",
+        "127.0.0.0/8,",
+        "127.0.0.0/+8",
+    ] {
+        let config = format!(
+            "Match localnetwork \"{networks}\"\n  Port 1001\nMatch !localnetwork={networks}\n  Port 1002\n"
+        );
+        h.config(&config, &["h"]);
+    }
+}
