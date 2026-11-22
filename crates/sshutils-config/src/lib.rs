@@ -8,6 +8,7 @@
 //!   `ssh -G` prints ([`Options::dump`]).
 
 pub mod algorithms;
+pub mod canonical;
 pub mod client;
 pub mod expand;
 pub mod forward;
@@ -19,6 +20,6 @@ pub mod options;
 pub mod reader;
 pub mod values;
 
-pub use client::{Request, Resolved, resolve};
+pub use client::{Request, Resolved, resolve, resolve_with};
 pub use options::Options;
 pub use reader::{Context, Fatal, Flags, Reader};

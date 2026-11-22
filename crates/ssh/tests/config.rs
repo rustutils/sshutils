@@ -552,8 +552,8 @@ fn values_and_errors() {
         "AddKeysToAgent confirm 5m\nForwardAgent ~/agent.sock\n",
         "StrictHostKeyChecking accept-new\nUpdateHostKeys ask\n",
         "PubkeyAuthentication host-bound\nCanonicalizeHostname no\n",
-        // With permitted CNAMEs OpenSSH looks the host up unless it goes
-        // through a proxy (DNS isn't implemented yet).
+        // With permitted CNAMEs the host is looked up unless it goes
+        // through a proxy; see `canonicalization` for that.
         "CanonicalDomains a.test b.test\nCanonicalizePermittedCNAMEs *.a:*.b,*.c\n\
          ProxyCommand nc %h %p\n",
         "GlobalKnownHostsFile none\nUserKnownHostsFile none\n",
@@ -619,5 +619,117 @@ fn match_localnetwork() {
             "Match localnetwork \"{networks}\"\n  Port 1001\nMatch !localnetwork={networks}\n  Port 1002\n"
         );
         h.config(&config, &["h"]);
+    }
+}
+
+#[test]
+fn canonicalization() {
+    let openssh = require_openssh!();
+    let h = Harness::new(&openssh);
+    // Addresses are canonicalized even without CanonicalizeHostname.
+    for args in [
+        &["-G", "127.1"][..],
+        &["-G", "0x7f.1"],
+        &["-G", "1.2.3"],
+        &["-G", "::0001"],
+        &["-G", "FE80::1"],
+        &["-G", "fe80::1%lo"],
+        &["-G", "fe80::1%nonexistent"],
+        &["-G", "-4", "::1"],
+        &["-G", "-6", "127.1"],
+        &["-G", "-o", "Hostname=127.1", "h"],
+    ] {
+        h.args(args);
+    }
+
+    // Names under .invalid never resolve; localhost always does. Both
+    // implementations use the same resolver, so the outcome is the same
+    // either way.
+    let canonical = "\
+Host *.invalid localhost localhost.*
+  User canonical
+Match canonical
+  Port 2001
+Match final
+  ServerAliveInterval 7
+";
+    for (settings, host) in [
+        (
+            "CanonicalizeHostname yes\nCanonicalDomains invalid\n",
+            "foo",
+        ),
+        (
+            "CanonicalizeHostname yes\nCanonicalDomains invalid\n",
+            "LOCALHOST",
+        ),
+        (
+            "CanonicalizeHostname yes\nCanonicalDomains invalid localdomain\n",
+            "localhost",
+        ),
+        (
+            "CanonicalizeHostname yes\nCanonicalizeFallbackLocal no\nCanonicalDomains invalid\n",
+            "foo",
+        ),
+        (
+            "CanonicalizeHostname yes\nCanonicalizeFallbackLocal no\n",
+            "foo",
+        ),
+        (
+            "CanonicalizeHostname yes\nCanonicalizeFallbackLocal no\n",
+            "foo.invalid.",
+        ),
+        (
+            "CanonicalizeHostname yes\nCanonicalizeFallbackLocal no\n",
+            "localhost.",
+        ),
+        (
+            "CanonicalizeHostname yes\nCanonicalizeFallbackLocal no\nCanonicalDomains invalid\n",
+            "a.b",
+        ),
+        (
+            "CanonicalizeHostname yes\nCanonicalizeFallbackLocal no\nCanonicalizeMaxDots 0\nCanonicalDomains invalid\n",
+            "a.b",
+        ),
+        (
+            "CanonicalizeHostname yes\nCanonicalizeFallbackLocal no\nCanonicalDomains none invalid\n",
+            "foo",
+        ),
+        (
+            "CanonicalizeHostname yes\nCanonicalizeFallbackLocal no\nCanonicalDomains invalid\nProxyCommand nc %h %p\n",
+            "foo",
+        ),
+        (
+            "CanonicalizeHostname always\nCanonicalizeFallbackLocal no\nCanonicalDomains invalid\nProxyCommand nc %h %p\n",
+            "foo",
+        ),
+        (
+            "CanonicalizeHostname yes\nCanonicalizeFallbackLocal no\nCanonicalDomains invalid\nProxyJump j\n",
+            "foo",
+        ),
+        (
+            "CanonicalizeHostname yes\nCanonicalDomains invalid\nHostname foo.invalid.\n",
+            "x",
+        ),
+        // Permitted CNAMEs: the host is looked up even without
+        // canonicalization, and a direct connection fails if it doesn't
+        // resolve.
+        ("CanonicalizePermittedCNAMEs *:*\n", "foo.invalid"),
+        ("CanonicalizePermittedCNAMEs *:*\n", "localhost"),
+        (
+            "CanonicalizePermittedCNAMEs *:*\nProxyCommand nc %h %p\n",
+            "foo.invalid",
+        ),
+        (
+            "CanonicalizePermittedCNAMEs *:*\nCanonicalizeHostname always\nProxyCommand nc %h %p\n",
+            "foo.invalid",
+        ),
+        ("CanonicalizePermittedCNAMEs none\n", "foo.invalid"),
+        (
+            "CanonicalizePermittedCNAMEs *:*\nCanonicalizeHostname yes\nCanonicalDomains invalid\n",
+            "foo",
+        ),
+    ] {
+        h.config(&format!("{settings}{canonical}"), &[host]);
+        h.config(&format!("{settings}{canonical}"), &["-4", host]);
     }
 }

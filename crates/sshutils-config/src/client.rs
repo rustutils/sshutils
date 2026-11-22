@@ -4,6 +4,7 @@
 
 use std::path::PathBuf;
 
+use crate::canonical::{self, Resolver, SystemResolver};
 use crate::expand::{self, connection_hash, expand_tilde};
 use crate::forward::{Endpoint, valid_user};
 use crate::options::Options;
@@ -36,6 +37,9 @@ pub struct Resolved {
     pub host: String,
     /// The remote command, including an expanded `RemoteCommand`.
     pub command: String,
+    /// The host's addresses, if canonicalization already looked them up.
+    /// (Their port is the one at the time of the lookup.)
+    pub addresses: Option<Vec<std::net::SocketAddr>>,
 }
 
 /// Where the user and system configurations live.
@@ -105,11 +109,6 @@ fn read_files(
     result.map(|()| reader.want_final_pass)
 }
 
-/// Is `host` a numeric IPv4 or IPv6 address?
-fn is_address(host: &str) -> bool {
-    host.parse::<std::net::IpAddr>().is_ok()
-}
-
 impl Context {
     /// The context for `-o` options: the destination if it is known yet,
     /// no remote command.
@@ -131,6 +130,16 @@ impl Context {
 /// OpenSSH reports without stopping are added to `warnings`, also when
 /// resolving fails.
 pub fn resolve(
+    options: Options,
+    request: &Request,
+    warnings: &mut Vec<String>,
+) -> Result<Resolved, Fatal> {
+    resolve_with(&SystemResolver, options, request, warnings)
+}
+
+/// [`resolve`] with another resolver for host names.
+pub fn resolve_with(
+    resolver: &dyn Resolver,
     mut options: Options,
     request: &Request,
     warnings: &mut Vec<String>,
@@ -160,12 +169,19 @@ pub fn resolve(
             .map_err(|e| Fatal(format!("percent_expand: {e}")))?;
         options.hostname = Some(host.clone());
     }
-    if !is_address(&host) {
+    let was_address = canonical::is_address(resolver, &options, &host);
+    if !was_address {
         host = host.to_ascii_lowercase();
     }
-    // Hostname canonicalization (DNS lookups) is not implemented yet; with
-    // it enabled the configuration is still read a second time, as OpenSSH
-    // does.
+    let mut addresses = None;
+    if options.canonicalize_hostname != Some(CANONICALIZE_NO) || was_address {
+        addresses = canonical::canonicalize(resolver, &options, &mut host, warnings)?;
+    }
+    if addresses.is_none() {
+        addresses = canonical::follow_aliases(resolver, &options, &mut host, warnings)?;
+    }
+    // With canonicalization enabled the configuration is read again, as
+    // new blocks may match the canonical name.
     if options.canonicalize_hostname != Some(CANONICALIZE_NO) {
         want_final_pass = true;
     }
@@ -398,6 +414,7 @@ pub fn resolve(
         options,
         host,
         command,
+        addresses,
     })
 }
 

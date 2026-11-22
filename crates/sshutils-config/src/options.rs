@@ -353,7 +353,8 @@ impl Options {
         {
             self.jump_host = None;
         }
-        if self.permitted_cnames.len() == 1 && self.permitted_cnames[0].source.is_empty() {
+        // `CanonicalizePermittedCNAMEs none`.
+        if self.permitted_cnames.len() == 1 && !crate::canonical::has_permitted_cnames(self) {
             self.permitted_cnames.clear();
         }
         Ok(())

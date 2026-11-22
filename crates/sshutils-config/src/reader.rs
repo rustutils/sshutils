@@ -1321,7 +1321,7 @@ fn parse_permit_open(arg: &str) -> Option<bool> {
 }
 
 /// A domain name for `CanonicalDomains`.
-fn valid_domain(name: &str) -> Result<(), String> {
+pub(crate) fn valid_domain(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("empty domain name".into());
     }
