@@ -10,6 +10,8 @@ repository.workspace = true
 clap.workspace = true
 lexopt.workspace = true
 libc.workspace = true
+# 3des-cbc, which OpenSSH still offers (never by default).
+russh = { workspace = true, features = ["des"] }
 sshutils-config.workspace = true
 sshutils-core.workspace = true
 

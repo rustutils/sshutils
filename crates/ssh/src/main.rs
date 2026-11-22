@@ -1,9 +1,11 @@
 //! `ssh`: the OpenSSH remote login client.
 //!
-//! So far this reads the command line and the configuration, and `-G`
-//! prints the result. Connecting comes next.
+//! So far this reads the command line and the configuration, `-G` prints
+//! the result and `-Q` lists the supported algorithms. Connecting comes
+//! next.
 
 mod args;
+mod query;
 
 use std::ffi::OsString;
 use std::io::Write;
@@ -30,6 +32,8 @@ enum Exit {
     Usage(String),
     /// Print the message (if not empty) and exit with the status.
     Message(u8, String),
+    /// Print the text on stdout and exit successfully (`-Q`).
+    Print(String),
 }
 
 impl Exit {
@@ -100,6 +104,10 @@ fn main() -> ExitCode {
             }
             eprintln!("{USAGE}");
             ExitCode::from(255)
+        }
+        Err(Exit::Print(text)) => {
+            println!("{text}");
+            ExitCode::SUCCESS
         }
         Err(Exit::Message(status, message)) => {
             if !message.is_empty() {
@@ -279,7 +287,13 @@ fn apply_option(
             cli.mux_command = Some(arg.to_string());
         }
         'P' => set_once(&mut o.tag, arg.to_string()),
-        'Q' => return Err(Exit::fatal("-Q is not supported yet")),
+        'Q' => {
+            // Answered right away, before the rest of the command line.
+            return Err(match query::query(arg) {
+                Some(text) => Exit::Print(text),
+                None => Exit::fatal(format!("Unsupported query \"{arg}\"")),
+            });
+        }
         'a' => o.forward_agent = Some(0),
         'A' => o.forward_agent = Some(1),
         'k' => o.gss_deleg_creds = Some(0),
