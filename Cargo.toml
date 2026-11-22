@@ -13,10 +13,12 @@ repository = "https://github.com/rustutils/sshutils"
 
 [workspace.dependencies]
 sshutils-core = { path = "crates/sshutils-core", version = "0.1.0" }
+sshutils-config = { path = "crates/sshutils-config", version = "0.1.0" }
 sshutils-testing = { path = "crates/sshutils-testing" }
 russh = { version = "0.65.2", path = "vendor/russh/russh" }
 clap = { version = "4.6.9", features = ["derive"] }
 glob = "0.3.4"
+lexopt = "0.3.2"
 base64ct = { version = "1.8.3", features = ["alloc"] }
 bcrypt-pbkdf = "0.11.0"
 hmac = "0.13.0"

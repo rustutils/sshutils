@@ -26,6 +26,9 @@
 //! - A remote command after the destination (`ssh host ls -l`): a trailing
 //!   `Vec<OsString>` positional with `trailing_var_arg = true` and
 //!   `allow_hyphen_values = true`.
+//!
+//! `ssh` itself doesn't use this: its options apply in command-line order,
+//! which clap doesn't preserve, so it reads them with `lexopt` instead.
 
 use std::ffi::OsString;
 
