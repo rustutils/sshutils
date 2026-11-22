@@ -45,18 +45,48 @@ fn assert_same(comparison: &Comparison) {
     );
 }
 
+/// An askpass program that records each prompt in `prompts` (in the
+/// current directory) and answers with `$ANSWER_1`, `$ANSWER_2`, ...
+const ASKPASS: &str = r#"#!/bin/sh
+printf '%s\n--\n' "$1" >> prompts
+n=$(cat .answers 2>/dev/null || echo 0)
+n=$((n + 1))
+echo "$n" > .answers
+eval "printf '%s\n' \"\$ANSWER_$n\""
+"#;
+
+/// One differential run.
+#[derive(Default)]
+struct Case<'a> {
+    /// Files written into each client's scratch directory first.
+    files: Vec<(&'a str, String)>,
+    /// Options before the defaults (so they win over them).
+    args: Vec<&'a str>,
+    /// Answers to the prompts, in order; prompting is enabled if given.
+    answers: Vec<&'a str>,
+    /// Files compared afterwards (hashed names normalized).
+    compare: Vec<&'a str>,
+}
+
 struct Harness {
     sshd: Sshd,
     ssh: Differential,
     keygen: std::path::PathBuf,
+    askpass: tempfile::TempDir,
 }
 
 impl Harness {
     fn new(openssh: &Openssh, host_key_types: &[&str]) -> Harness {
+        let askpass = tempfile::tempdir().unwrap();
+        let script = askpass.path().join("askpass");
+        fs::write(&script, ASKPASS).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
         Harness {
             sshd: Sshd::start_with_host_keys(openssh, host_key_types),
             ssh: Differential::new(OURS, openssh.require_tool("ssh")),
             keygen: openssh.require_tool("ssh-keygen"),
+            askpass,
         }
     }
 
@@ -97,12 +127,19 @@ impl Harness {
         self.check_files(&[("known_hosts", known_hosts)], args);
     }
 
-    /// Like [`check`](Self::check), with several files. `args` come
-    /// first, so they win over the defaults set here; without a `-F` in
-    /// them, no configuration file is read.
+    /// Like [`check`](Self::check), with several files. Without a `-F` in
+    /// `args`, no configuration file is read.
     fn check_files(&self, files: &[(&str, &str)], args: &[&str]) {
-        let mut full: Vec<String> = args.iter().map(|a| a.to_string()).collect();
-        if !args.contains(&"-F") {
+        self.run(Case {
+            files: files.iter().map(|(n, c)| (*n, c.to_string())).collect(),
+            args: args.to_vec(),
+            ..Case::default()
+        });
+    }
+
+    fn run(&self, case: Case<'_>) {
+        let mut full: Vec<String> = case.args.iter().map(|a| a.to_string()).collect();
+        if !case.args.contains(&"-F") {
             full.extend(["-F".into(), "none".into()]);
         }
         for option in [
@@ -117,33 +154,74 @@ impl Harness {
             full.extend(["-o".into(), option.into()]);
         }
         full.extend(["-p".into(), self.port(), "127.0.0.1".into(), "true".into()]);
-        let files: Vec<(String, String)> = files
+        let files: Vec<(String, String)> = case
+            .files
             .iter()
-            .map(|(n, c)| (n.to_string(), c.to_string()))
+            .map(|(n, c)| (n.to_string(), c.clone()))
             .collect();
         let keygen = self.keygen.clone();
-        let comparison = self
-            .ssh
-            .case(full)
-            .setup(move |dir: &Path| {
-                for (name, content) in &files {
-                    fs::write(dir.join(name), content).unwrap();
-                    if name.ends_with(".hashed") {
-                        let status = std::process::Command::new(&keygen)
-                            .arg("-H")
-                            .arg("-f")
-                            .arg(dir.join(name))
-                            .stdout(std::process::Stdio::null())
-                            .stderr(std::process::Stdio::null())
-                            .status()
-                            .unwrap();
-                        assert!(status.success());
-                    }
+        let mut run = self.ssh.case(full).setup(move |dir: &Path| {
+            for (name, content) in &files {
+                let path = dir.join(name);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(&path, content).unwrap();
+                if name.ends_with(".hashed") {
+                    let status = std::process::Command::new(&keygen)
+                        .arg("-H")
+                        .arg("-f")
+                        .arg(&path)
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status()
+                        .unwrap();
+                    assert!(status.success());
                 }
-            })
-            .run();
+            }
+        });
+        if !case.answers.is_empty() {
+            run = run
+                .env("SSH_ASKPASS", self.askpass.path().join("askpass"))
+                .env("SSH_ASKPASS_REQUIRE", "force");
+            for (i, answer) in case.answers.iter().enumerate() {
+                run = run.env(format!("ANSWER_{}", i + 1), answer);
+            }
+        }
+        let comparison = run.run();
         assert_same(&comparison);
+        let names = [self.name(), "127.0.0.1".to_string()];
+        for file in case.compare.iter().chain(["prompts"].iter()) {
+            let read = |run: &sshutils_testing::Run| {
+                fs::read_to_string(run.path(file))
+                    .ok()
+                    .map(|t| normalize_hashes(&t, &names))
+            };
+            let (ours, theirs) = (read(&comparison.ours), read(&comparison.theirs));
+            assert_eq!(
+                ours, theirs,
+                "{file} differs for args {:?}\n--- ours:\n{ours:?}\n--- OpenSSH:\n{theirs:?}",
+                comparison.args
+            );
+        }
     }
+}
+
+/// Replace hashed host names by `HASHED(<name>)`, naming which of `names`
+/// the hash is of.
+fn normalize_hashes(text: &str, names: &[String]) -> String {
+    use sshutils_core::known_hosts::Line;
+    text.lines()
+        .map(|line| match Line::parse(line) {
+            Line::Entry(entry) if entry.is_hashed() => {
+                let name = names
+                    .iter()
+                    .find(|n| entry.matches(n))
+                    .map_or("?", |n| n.as_str());
+                format!("HASHED({name}) {}", entry.key_text)
+            }
+            _ => line.to_string(),
+        })
+        .map(|line| line + "\n")
+        .collect()
 }
 
 #[test]
@@ -447,5 +525,220 @@ fn connection_failures() {
             }
         });
         run(&["-p", &port, "127.0.0.1", "true"]);
+    }
+}
+
+#[test]
+fn new_host_keys() {
+    let openssh = require_openssh!();
+    let h = Harness::new(&openssh, &["ed25519"]);
+    let name = h.name();
+    let key = h.host_key("ed25519");
+    let other = h.other_key("ed25519");
+    let known = |text: &str| vec![("known_hosts", text.to_string())];
+
+    // Added without asking.
+    for mode in ["accept-new", "no", "off"] {
+        let option = format!("StrictHostKeyChecking={mode}");
+        h.run(Case {
+            files: known(""),
+            args: vec!["-o", &option],
+            compare: vec!["known_hosts"],
+            ..Case::default()
+        });
+        h.run(Case {
+            files: known(""),
+            args: vec!["-o", &option, "-o", "HashKnownHosts=yes"],
+            compare: vec!["known_hosts"],
+            ..Case::default()
+        });
+    }
+    // The file gets a final newline first; other entries stay.
+    h.run(Case {
+        files: known(&format!("other {other}")),
+        args: vec!["-o", "StrictHostKeyChecking=accept-new"],
+        compare: vec!["known_hosts"],
+        ..Case::default()
+    });
+    // A missing file is created, a missing directory is not.
+    h.run(Case {
+        args: vec!["-o", "StrictHostKeyChecking=accept-new"],
+        compare: vec!["known_hosts"],
+        ..Case::default()
+    });
+    h.run(Case {
+        args: vec![
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            "-o",
+            "UserKnownHostsFile=missing/known_hosts",
+        ],
+        compare: vec!["missing/known_hosts"],
+        ..Case::default()
+    });
+    // With nowhere to write, new keys are refused.
+    h.run(Case {
+        args: vec![
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            "-o",
+            "UserKnownHostsFile=none",
+        ],
+        ..Case::default()
+    });
+    // Recorded under the alias, lowercased.
+    h.run(Case {
+        files: known(""),
+        args: vec![
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            "-o",
+            "HostKeyAlias=My.Alias",
+        ],
+        compare: vec!["known_hosts"],
+        ..Case::default()
+    });
+    // Known without the port: nothing is added.
+    h.run(Case {
+        files: known(&format!("127.0.0.1 {key}\n")),
+        args: vec!["-o", "StrictHostKeyChecking=accept-new"],
+        compare: vec!["known_hosts"],
+        ..Case::default()
+    });
+    // CheckHostIP is off for loopback addresses.
+    h.run(Case {
+        files: known(""),
+        args: vec![
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            "-o",
+            "CheckHostIP=yes",
+        ],
+        compare: vec!["known_hosts"],
+        ..Case::default()
+    });
+    // The fingerprint of a known key.
+    h.check(&format!("{name} {key}\n"), &["-o", "VisualHostKey=yes"]);
+}
+
+#[test]
+fn host_key_prompts() {
+    let openssh = require_openssh!();
+    let h = Harness::new(&openssh, &["ed25519"]);
+    let key = h.host_key("ed25519");
+    let fingerprint = {
+        let out = std::process::Command::new(&h.keygen)
+            .arg("-lf")
+            .arg(h.sshd.host_key_pub_of("ed25519"))
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .to_string()
+    };
+    let ask = |answers: Vec<&str>, extra: &[&str], known: &str| {
+        let mut args = vec!["-o", "StrictHostKeyChecking=ask", "-o", "BatchMode=no"];
+        args.extend_from_slice(extra);
+        h.run(Case {
+            files: vec![("known_hosts", known.to_string())],
+            args,
+            answers,
+            compare: vec!["known_hosts"],
+        });
+    };
+
+    ask(vec!["yes"], &[], "");
+    ask(vec!["YES"], &[], "");
+    ask(vec!["  yes  "], &[], "");
+    ask(vec!["no"], &[], "");
+    ask(vec![""], &[], "");
+    ask(vec![&fingerprint], &[], "");
+    ask(vec![&fingerprint.to_lowercase()], &[], "");
+    ask(vec!["maybe", "perhaps", "yes"], &[], "");
+    ask(vec!["maybe", "no"], &[], "");
+    ask(vec!["yes"], &["-o", "VisualHostKey=yes"], "");
+    ask(vec!["yes"], &["-o", "HashKnownHosts=yes"], "");
+    ask(vec!["yes"], &["-o", "FingerprintHash=md5"], "");
+    // The same key under other names.
+    let many: String = (0..10).map(|i| format!("other{i} {key}\n")).collect();
+    ask(vec!["no"], &[], &format!("other {key}\n"));
+    ask(vec!["no"], &[], &many);
+    ask(vec!["no"], &[], &format!("@cert-authority other {key}\n"));
+    h.run(Case {
+        files: vec![("known_hosts.hashed", format!("other {key}\n"))],
+        args: vec![
+            "-o",
+            "StrictHostKeyChecking=ask",
+            "-o",
+            "BatchMode=no",
+            "-o",
+            "UserKnownHostsFile=known_hosts.hashed",
+        ],
+        answers: vec!["no"],
+        compare: vec![],
+    });
+    // Batch mode never asks.
+    h.run(Case {
+        files: vec![("known_hosts", String::new())],
+        args: vec!["-o", "StrictHostKeyChecking=ask"],
+        answers: vec!["yes"],
+        compare: vec!["known_hosts"],
+    });
+    // Neither does a client without a terminal or askpass program.
+    h.check(
+        "",
+        &["-o", "StrictHostKeyChecking=ask", "-o", "BatchMode=no"],
+    );
+}
+
+#[test]
+fn changed_keys_without_strict_checking() {
+    let openssh = require_openssh!();
+    let h = Harness::new(&openssh, &["ed25519"]);
+    let name = h.name();
+    let key = h.host_key("ed25519");
+    let other = h.other_key("ed25519");
+    let changed = format!("{name} {other}\n");
+    let revoked = format!("@revoked {name} {key}\n");
+    let off = ["-o", "StrictHostKeyChecking=off"];
+    for known in [&changed, &revoked] {
+        h.check(known, &off);
+        h.check(
+            known,
+            &[
+                &off[..],
+                &[
+                    "-o",
+                    "PasswordAuthentication=no",
+                    "-o",
+                    "KbdInteractiveAuthentication=no",
+                ],
+            ]
+            .concat(),
+        );
+        h.check(
+            known,
+            &[
+                &off[..],
+                &["-A", "-X", "-L", "1234:localhost:1", "-w", "any"],
+            ]
+            .concat(),
+        );
+        h.check(known, &[&off[..], &["-o", "UpdateHostKeys=yes"]].concat());
+        h.check(
+            known,
+            &[
+                &off[..],
+                &["-o", "ExitOnForwardFailure=yes", "-R", "1234:localhost:1"],
+            ]
+            .concat(),
+        );
+        h.check(
+            known,
+            &[&off[..], &["-o", "ExitOnForwardFailure=yes"]].concat(),
+        );
     }
 }

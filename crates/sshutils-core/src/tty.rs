@@ -4,8 +4,9 @@
 //! terminal, or from an askpass program (`SSH_ASKPASS`), following the same
 //! rules as OpenSSH:
 //!
-//! - An askpass program is *allowed* when `DISPLAY` is non-empty, or when
-//!   `SSH_ASKPASS_REQUIRE=force`; `SSH_ASKPASS_REQUIRE=never` forbids it.
+//! - An askpass program is *allowed* when `DISPLAY` or `WAYLAND_DISPLAY` is
+//!   non-empty, or when `SSH_ASKPASS_REQUIRE=force`;
+//!   `SSH_ASKPASS_REQUIRE=never` forbids it.
 //! - It is *used* if allowed and either stdin isn't a terminal,
 //!   `SSH_ASKPASS_REQUIRE=force`, or `SSH_ASKPASS_REQUIRE=prefer`.
 //! - The program gets the prompt as its only argument and prints the
@@ -28,7 +29,7 @@ const DEFAULT_ASKPASS: &[&str] = &[
 /// or stdin (see the module documentation). End of input or a cancelled
 /// askpass program yields an empty passphrase, as in OpenSSH.
 pub fn read_passphrase(prompt: &str) -> io::Result<String> {
-    let display = std::env::var_os("DISPLAY");
+    let display = display();
     let require = std::env::var_os("SSH_ASKPASS_REQUIRE");
     if use_askpass(display.as_deref(), require.as_deref(), stdin_is_terminal()) {
         return Ok(run_askpass(prompt, None).unwrap_or_default());
@@ -45,12 +46,51 @@ pub fn read_passphrase(prompt: &str) -> io::Result<String> {
     }
 }
 
+/// Ask a question on the controlling terminal with echo, like OpenSSH's
+/// `read_passphrase(prompt, RP_ECHO)` (used for `ssh`'s host key
+/// questions): the answer never comes from stdin. Without a terminal, an
+/// allowed askpass program is asked instead; failing both, or when the
+/// program is cancelled, the answer is empty.
+pub fn ask_terminal(prompt: &str) -> String {
+    let display = display();
+    let require = std::env::var_os("SSH_ASKPASS_REQUIRE");
+    let (allowed, preferred) = askpass_rules(display.as_deref(), require.as_deref());
+    let terminal = if preferred {
+        None
+    } else {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+            .ok()
+    };
+    match terminal {
+        Some(mut tty) => {
+            // Start the prompt at the beginning of the line.
+            if tty.write_all(b"\r").is_err() || tty.write_all(prompt.as_bytes()).is_err() {
+                return String::new();
+            }
+            let mut line = String::new();
+            let mut reader = io::BufReader::new(tty);
+            if reader.read_line(&mut line).is_err() {
+                return String::new();
+            }
+            while line.ends_with(['\n', '\r']) {
+                line.pop();
+            }
+            line
+        }
+        None if allowed => run_askpass(prompt, None).unwrap_or_default(),
+        None => String::new(),
+    }
+}
+
 /// Ask a yes/no question through the askpass program, like OpenSSH's
 /// `ask_permission` (used for `ssh-agent` key confirmations). The program
 /// gets `SSH_ASKPASS_PROMPT=confirm`; an empty answer or `yes` (any case)
 /// means yes. Without an allowed askpass program, the answer is no.
 pub fn ask_permission(prompt: &str) -> bool {
-    let display = std::env::var_os("DISPLAY");
+    let display = display();
     let require = std::env::var_os("SSH_ASKPASS_REQUIRE");
     if !askpass_rules(display.as_deref(), require.as_deref()).0 {
         return false;
@@ -61,7 +101,14 @@ pub fn ask_permission(prompt: &str) -> bool {
     }
 }
 
-/// `(allowed, preferred)` for an askpass program given `DISPLAY` and
+/// `DISPLAY`, or failing that `WAYLAND_DISPLAY`.
+fn display() -> Option<OsString> {
+    std::env::var_os("DISPLAY")
+        .filter(|d| !d.is_empty())
+        .or_else(|| std::env::var_os("WAYLAND_DISPLAY"))
+}
+
+/// `(allowed, preferred)` for an askpass program given the display and
 /// `SSH_ASKPASS_REQUIRE`.
 fn askpass_rules(
     display: Option<&std::ffi::OsStr>,

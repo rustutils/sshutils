@@ -54,8 +54,44 @@ pub fn set_level(level: i32) {
     logger().level = level;
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Messages logged by this thread while capturing (tests only).
+    static CAPTURED: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Collect this thread's messages at level `INFO` or more severe instead of
+/// printing them, until [`captured`] is called.
+#[cfg(test)]
+pub fn capture() {
+    CAPTURED.with(|c| *c.borrow_mut() = Some(Vec::new()));
+}
+
+/// Stop capturing and return the messages.
+#[cfg(test)]
+pub fn captured() -> Vec<String> {
+    CAPTURED.with(|c| c.borrow_mut().take().unwrap_or_default())
+}
+
 /// Log `message` at `level`, if that level is shown.
 pub fn log(level: i32, message: &str) {
+    #[cfg(test)]
+    {
+        let captured = CAPTURED.with(|c| {
+            let mut c = c.borrow_mut();
+            if let Some(messages) = c.as_mut() {
+                if level <= INFO {
+                    messages.push(message.to_string());
+                }
+                true
+            } else {
+                false
+            }
+        });
+        if captured {
+            return;
+        }
+    }
     let mut logger = logger();
     if level > logger.level {
         return;

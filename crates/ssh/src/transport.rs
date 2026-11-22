@@ -148,6 +148,8 @@ fn config(options: &Options, host_key_algorithms: &str) -> client::Config {
 struct Outcome {
     host_key_rejected: bool,
     kex: Option<String>,
+    /// The options after the host key check, which may have restricted them.
+    options: Option<Options>,
 }
 
 /// Checks the server's host key for russh.
@@ -155,8 +157,32 @@ pub struct Client {
     host: String,
     peer: SocketAddr,
     port: u16,
-    options: Arc<Options>,
+    options: Options,
     outcome: Arc<Mutex<Outcome>>,
+}
+
+/// Ask a yes/no question like OpenSSH's `confirm()`: never in batch mode;
+/// otherwise until the answer is yes, no (or empty), or the fingerprint.
+fn confirm(options: &Options, prompt: &str, fingerprint: Option<&str>) -> bool {
+    if options.batch_mode == Some(1) {
+        return false;
+    }
+    let mut message = prompt.to_string();
+    loop {
+        let answer = sshutils_core::tty::ask_terminal(&message);
+        let answer = answer.trim_start_matches([' ', '\t']);
+        let answer = answer.split([' ', '\t', '\n']).next().unwrap_or_default();
+        if answer.is_empty() || answer.eq_ignore_ascii_case("no") {
+            return false;
+        }
+        if answer.eq_ignore_ascii_case("yes") || fingerprint == Some(answer) {
+            return true;
+        }
+        message = match fingerprint {
+            Some(_) => "Please type 'yes', 'no' or the fingerprint: ".to_string(),
+            None => "Please type 'yes' or 'no': ".to_string(),
+        };
+    }
 }
 
 impl client::Handler for Client {
@@ -173,10 +199,19 @@ impl client::Handler for Client {
                 PublicKey::new(certificate.public_key().clone(), "")
             }
         };
-        let accepted = hostkeys::verify(&self.host, self.peer, self.port, &key, &self.options);
-        if !accepted {
-            self.outcome.lock().unwrap().host_key_rejected = true;
+        let mut options = self.options.clone();
+        let batch = self.options.clone();
+        let mut ask =
+            |prompt: &str, fingerprint: Option<&str>| confirm(&batch, prompt, fingerprint);
+        let accepted = hostkeys::Verifier {
+            options: &mut options,
+            peer: self.peer,
+            confirm: &mut ask,
         }
+        .verify(&self.host, self.port, &key);
+        let mut outcome = self.outcome.lock().unwrap();
+        outcome.host_key_rejected = !accepted;
+        outcome.options = Some(options);
         Ok(accepted)
     }
 
@@ -192,9 +227,11 @@ impl client::Handler for Client {
 }
 
 /// An established, not yet authenticated connection.
+#[allow(dead_code)] // Authentication comes next.
 pub struct Transport {
-    #[allow(dead_code)] // Authentication comes next.
     pub handle: Handle<Client>,
+    /// The options, as the host key check left them.
+    pub options: Options,
 }
 
 /// `<address> port <port>`, as OpenSSH names the peer in messages.
@@ -221,7 +258,7 @@ pub async fn establish(
         host: host.to_string(),
         peer,
         port,
-        options: Arc::clone(&options),
+        options: (*options).clone(),
         outcome: Arc::clone(&outcome),
     };
     let identification = Arc::new(Mutex::new(None));
@@ -252,7 +289,13 @@ pub async fn establish(
         log::info("** This session may be vulnerable to \"store now, decrypt later\" attacks.");
         log::info("** The server may need to be upgraded. See https://openssh.com/pq.html");
     }
-    Ok(Transport { handle })
+    let options = outcome
+        .lock()
+        .unwrap()
+        .options
+        .take()
+        .unwrap_or_else(|| (*options).clone());
+    Ok(Transport { handle, options })
 }
 
 /// Key exchange methods that resist quantum computers.
