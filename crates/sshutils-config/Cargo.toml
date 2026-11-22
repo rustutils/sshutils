@@ -1,0 +1,17 @@
+[package]
+name = "sshutils-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+glob.workspace = true
+libc.workspace = true
+sha1.workspace = true
+sshutils-core.workspace = true
+
+[dev-dependencies]
+sshutils-testing.workspace = true
+tempfile.workspace = true
