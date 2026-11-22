@@ -11,8 +11,8 @@ use std::task::{Context, Poll, ready};
 use std::time::{Duration, Instant};
 
 use russh::client::{self, Handle};
-use russh::keys::{Algorithm, PublicKey};
-use russh::{AlgorithmKind, Preferred, SshId};
+use russh::keys::Algorithm;
+use russh::{AlgorithmKind, HostKeyAlgorithm, Preferred, SshId};
 use sshutils_config::Options;
 use sshutils_config::algorithms::{self, ALL_KEY, DEFAULT_KEY};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -94,18 +94,25 @@ fn config(options: &Options, host_key_algorithms: &str) -> client::Config {
     let compression = supported(compression_list, |n| {
         russh::compression::Name::try_from(n).ok()
     });
-    // Host certificates are not offered until they can be verified.
-    let mut key: Vec<Algorithm> = Vec::new();
+    // Plain keys and certificates, interleaved in the configured order.
+    let mut host_key_order: Vec<HostKeyAlgorithm> = Vec::new();
     for name in host_key_algorithms.split(',') {
-        if name.ends_with("-cert-v01@openssh.com") {
+        let Some(algorithm) = hostkeys::key_algorithm(name) else {
             continue;
-        }
-        if let Some(algorithm) = hostkeys::key_algorithm(name)
-            && !key.contains(&algorithm)
-        {
-            key.push(algorithm);
+        };
+        let entry = HostKeyAlgorithm {
+            algorithm,
+            certificate: name.ends_with("-cert-v01@openssh.com"),
+        };
+        if !host_key_order.contains(&entry) {
+            host_key_order.push(entry);
         }
     }
+    let key: Vec<Algorithm> = host_key_order
+        .iter()
+        .filter(|a| !a.certificate)
+        .map(|a| a.algorithm.clone())
+        .collect();
 
     let mut limits = russh::Limits::default();
     // OpenSSH rekeys by data volume depending on the cipher unless
@@ -131,6 +138,7 @@ fn config(options: &Options, host_key_algorithms: &str) -> client::Config {
             kex: Cow::Owned(kex),
             key: Cow::Owned(key),
             host_key_certificates: Cow::Borrowed(&[]),
+            host_key_order: Cow::Owned(host_key_order),
             cipher: Cow::Owned(cipher),
             mac: Cow::Owned(mac),
             compression: Cow::Owned(compression),
@@ -193,10 +201,11 @@ impl client::Handler for Client {
         server_key: &russh::keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
         let key = match server_key {
-            russh::keys::PublicKeyOrCertificate::PublicKey { key, .. } => key.clone(),
+            russh::keys::PublicKeyOrCertificate::PublicKey { key, .. } => {
+                hostkeys::HostKey::Plain(key.clone())
+            }
             russh::keys::PublicKeyOrCertificate::Certificate(certificate) => {
-                // Not offered, so not expected; judge the key it certifies.
-                PublicKey::new(certificate.public_key().clone(), "")
+                hostkeys::HostKey::Certificate(Box::new(certificate.clone()))
             }
         };
         let mut options = self.options.clone();
@@ -527,21 +536,25 @@ mod tests {
                 .all(|m| !m.as_ref().starts_with("umac"))
         );
         assert!(!config.preferred.mac.is_empty());
-        // Certificates are not offered, and don't move their keys forward.
+        // Certificates are offered in their place in the list.
         let config2 = super::config(
             &options,
-            "ssh-ed25519-cert-v01@openssh.com,ecdsa-sha2-nistp256,ssh-ed25519",
+            "ssh-ed25519,ecdsa-sha2-nistp256-cert-v01@openssh.com,rsa-sha2-512-cert-v01@openssh.com,umac",
         );
+        let names: Vec<String> = config2
+            .preferred
+            .host_key_order
+            .iter()
+            .map(HostKeyAlgorithm::name)
+            .collect();
         assert_eq!(
-            config2.preferred.key.as_ref(),
+            names,
             [
-                Algorithm::Ecdsa {
-                    curve: russh::keys::EcdsaCurve::NistP256
-                },
-                Algorithm::Ed25519
+                "ssh-ed25519",
+                "ecdsa-sha2-nistp256-cert-v01@openssh.com",
+                "rsa-sha2-512-cert-v01@openssh.com"
             ]
         );
-        assert!(config2.preferred.host_key_certificates.is_empty());
         assert_eq!(config.preferred.compression[0].as_ref(), "none");
         options.compression = Some(sshutils_config::values::COMPRESSION_DELAYED);
         let config = super::config(&options, "ssh-ed25519");

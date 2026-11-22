@@ -7,9 +7,12 @@
 
 use std::net::SocketAddr;
 
-use russh::keys::{Algorithm, EcdsaCurve, PublicKey};
+use russh::keys::ssh_key::certificate::CertType;
+use russh::keys::ssh_key::public::KeyData;
+use russh::keys::{Algorithm, Certificate, EcdsaCurve, PublicKey};
 use sshutils_config::Options;
 use sshutils_config::expand::expand_tilde;
+use sshutils_config::matching::{match_pattern, match_pattern_list};
 use sshutils_config::values::*;
 use sshutils_core::keyfmt::{self, FingerprintHash};
 use sshutils_core::known_hosts::{Line, Marker};
@@ -30,6 +33,46 @@ pub struct Entry {
 #[derive(Debug, Default)]
 pub struct HostKeys {
     entries: Vec<Entry>,
+}
+
+/// The key a server presented: a plain key or a certificate.
+#[derive(Debug, Clone)]
+pub enum HostKey {
+    Plain(PublicKey),
+    Certificate(Box<Certificate>),
+}
+
+impl HostKey {
+    /// The key itself (for a certificate, the key it certifies).
+    pub fn key_data(&self) -> &KeyData {
+        match self {
+            HostKey::Plain(key) => key.key_data(),
+            HostKey::Certificate(certificate) => certificate.public_key(),
+        }
+    }
+
+    pub fn is_certificate(&self) -> bool {
+        matches!(self, HostKey::Certificate(_))
+    }
+
+    /// OpenSSH's type label: `ED25519`, or `ED25519-CERT` for a certificate.
+    fn label(&self) -> String {
+        let label = keyfmt::type_label(self.key_data());
+        match self {
+            HostKey::Plain(_) => label.to_string(),
+            HostKey::Certificate(_) => format!("{label}-CERT"),
+        }
+    }
+
+    /// The algorithm name, as in `ssh-ed25519-cert-v01@openssh.com`.
+    fn name(&self) -> String {
+        match self {
+            HostKey::Plain(key) => key.algorithm().as_str().to_string(),
+            HostKey::Certificate(certificate) => {
+                certificate.algorithm().to_certificate_type().to_string()
+            }
+        }
+    }
 }
 
 /// What the `known_hosts` files say about a key.
@@ -80,23 +123,42 @@ impl HostKeys {
         HostKeys { entries }
     }
 
-    /// Look a plain key up (`check_key_in_hostkeys`): a matching key makes
-    /// it known; otherwise any other key for the host, whatever its type,
-    /// means it changed. A key marked `@revoked` is revoked regardless.
-    pub fn check(&self, key: &PublicKey) -> Status<'_> {
+    /// Look a key up (`check_key_in_hostkeys`). A plain key is known if
+    /// an entry has it; otherwise any other key for the host, whatever its
+    /// type, means it changed. A certificate is known if an
+    /// `@cert-authority` entry has the key that signed it. Either is
+    /// revoked if an `@revoked` entry has the key (or a certificate's CA).
+    pub fn check(&self, key: &HostKey) -> Status<'_> {
         let mut status = Status::New;
-        for entry in self.entries.iter().filter(|e| e.marker == Marker::None) {
-            if entry.key.key_data() == key.key_data() {
-                status = Status::Ok(entry);
-                break;
+        match key {
+            HostKey::Plain(key) => {
+                for entry in self.entries.iter().filter(|e| e.marker == Marker::None) {
+                    if entry.key.key_data() == key.key_data() {
+                        status = Status::Ok(entry);
+                        break;
+                    }
+                    status = Status::Changed(entry);
+                }
             }
-            status = Status::Changed(entry);
+            HostKey::Certificate(certificate) => {
+                if let Some(entry) = self.entries.iter().find(|e| {
+                    e.marker == Marker::CertAuthority
+                        && e.key.key_data() == certificate.signature_key()
+                }) {
+                    status = Status::Ok(entry);
+                }
+            }
         }
-        if self
-            .entries
-            .iter()
-            .any(|e| e.marker == Marker::Revoked && e.key.key_data() == key.key_data())
-        {
+        let revoked = |data: &KeyData| {
+            self.entries
+                .iter()
+                .any(|e| e.marker == Marker::Revoked && e.key.key_data() == data)
+        };
+        let ca_revoked = match key {
+            HostKey::Certificate(certificate) => revoked(certificate.signature_key()),
+            HostKey::Plain(_) => false,
+        };
+        if revoked(key.key_data()) || ca_revoked {
             return Status::Revoked;
         }
         status
@@ -240,6 +302,24 @@ enum Access {
     Quiet,
 }
 
+/// What a check of the host key works with.
+struct Context {
+    /// The host name (lowercased).
+    hostname: String,
+    port: u16,
+    /// Whether this is the second look-up, without the port.
+    clobber_port: bool,
+    /// The name keys are recorded under, and the address.
+    host: String,
+    ip: String,
+    check_host_ip: bool,
+    host_keys: HostKeys,
+    ip_keys: Option<HostKeys>,
+    user_files: Vec<String>,
+    system_files: Vec<String>,
+    all_files: Vec<String>,
+}
+
 /// The decision about the server's host key (OpenSSH's `verify_host_key`
 /// and `check_host_key`).
 ///
@@ -259,12 +339,39 @@ impl Verifier<'_> {
     /// Decide whether to trust `key`, the host key of `host` (lowercased)
     /// on `port`. Messages are logged; `false` means the caller fails with
     /// "Host key verification failed.".
-    pub fn verify(&mut self, host: &str, port: u16, key: &PublicKey) -> bool {
-        let fingerprint = keyfmt::fingerprint(key.key_data(), fingerprint_hash(self.options));
-        log::debug(&format!(
-            "Server host key: {} {fingerprint}",
-            key.algorithm().as_str()
-        ));
+    pub fn verify(&mut self, host: &str, port: u16, key: &HostKey) -> bool {
+        let hash = fingerprint_hash(self.options);
+        let fingerprint = keyfmt::fingerprint(key.key_data(), hash);
+        match key {
+            HostKey::Plain(_) => {
+                log::debug(&format!("Server host key: {} {fingerprint}", key.name()));
+            }
+            HostKey::Certificate(certificate) => {
+                log::debug(&format!(
+                    "Server host certificate: {} {fingerprint}, serial {} ID \"{}\" CA {} {} valid {}",
+                    key.name(),
+                    certificate.serial(),
+                    certificate.key_id(),
+                    certificate.signature_key().algorithm().as_str(),
+                    keyfmt::fingerprint(certificate.signature_key(), hash),
+                    validity(certificate)
+                ));
+                for principal in certificate.valid_principals() {
+                    log::debug2(&format!("Server host certificate hostname: {principal}"));
+                }
+                // OpenSSH checks the CA's signature when it reads the
+                // certificate, and gives up on the connection if it's bad.
+                // Whether the CA is trusted is decided below.
+                if certificate.verify_signature().is_err() {
+                    log::fatal(&format!(
+                        "ssh_dispatch_run_fatal: Connection to {} port {}: incorrect signature",
+                        self.peer.ip(),
+                        self.peer.port()
+                    ));
+                    std::process::exit(255);
+                }
+            }
+        }
         self.check(host, port, key, Access::ReadWrite, false)
     }
 
@@ -272,7 +379,7 @@ impl Verifier<'_> {
         &mut self,
         hostname: &str,
         port: u16,
-        key: &PublicKey,
+        key: &HostKey,
         mut access: Access,
         clobber_port: bool,
     ) -> bool {
@@ -309,18 +416,69 @@ impl Verifier<'_> {
         let (user_files, system_files) = files(self.options);
         let all_files: Vec<String> = user_files.iter().chain(&system_files).cloned().collect();
         let host_keys = HostKeys::load(&host, &all_files);
-        let ip_keys = check_host_ip.then(|| HostKeys::load(&ip, &all_files));
+        // Addresses are not checked for certificates, nor (as in OpenSSH)
+        // for the plain key of a certificate that wasn't accepted.
+        let ip_keys =
+            (check_host_ip && !key.is_certificate()).then(|| HostKeys::load(&ip, &all_files));
+        let context = Context {
+            hostname: hostname.to_string(),
+            port,
+            clobber_port,
+            host,
+            ip,
+            check_host_ip,
+            host_keys,
+            ip_keys,
+            user_files,
+            system_files,
+            all_files,
+        };
 
+        let mut key = key.clone();
+        loop {
+            if self.decide(&context, &key, &mut access) {
+                return true;
+            }
+            // A certificate that wasn't accepted is tried as a plain key,
+            // unless it was revoked.
+            match &key {
+                HostKey::Certificate(certificate)
+                    if context.host_keys.check(&key) != Status::Revoked =>
+                {
+                    log::debug("No matching CA found. Retry with plain key");
+                    key = HostKey::Plain(PublicKey::new(certificate.public_key().clone(), ""));
+                }
+                _ => return false,
+            }
+        }
+    }
+
+    /// One pass of `check_host_key` for `key`.
+    fn decide(&mut self, context: &Context, key: &HostKey, access: &mut Access) -> bool {
+        let Context {
+            hostname,
+            host,
+            ip,
+            host_keys,
+            ip_keys,
+            user_files,
+            system_files,
+            all_files,
+            ..
+        } = context;
+        let (port, clobber_port, check_host_ip) =
+            (context.port, context.clobber_port, context.check_host_ip);
+        let want_cert = key.is_certificate();
         let hash = fingerprint_hash(self.options);
-        let label = keyfmt::type_label(key.key_data());
+        let label = key.label();
         let strict = self
             .options
             .strict_host_key_checking
             .unwrap_or(STRICT_HOSTKEY_ASK);
 
         let host_status = host_keys.check(key);
-        if access == Access::ReadWrite && user_files.is_empty() {
-            access = Access::ReadOnly;
+        if *access == Access::ReadWrite && user_files.is_empty() {
+            *access = Access::ReadOnly;
         }
         let mut host_ip_differ = false;
         let ip_status = match &ip_keys {
@@ -343,10 +501,29 @@ impl Verifier<'_> {
         let mut unsafe_continue = false;
         match &host_status {
             Status::Ok(found) => {
+                let what = if want_cert { "certificate" } else { "key" };
                 log::debug(&format!(
-                    "Host '{host}' is known and matches the {label} host key."
+                    "Host '{host}' is known and matches the {label} host {what}."
                 ));
-                log::debug(&format!("Found key in {}:{}", found.file, found.line));
+                let what = if want_cert { "CA key" } else { "key" };
+                log::debug(&format!("Found {what} in {}:{}", found.file, found.line));
+                if let HostKey::Certificate(certificate) = key {
+                    let name = self.options.host_key_alias.as_deref().unwrap_or(hostname);
+                    if let Err(reason) = check_certificate(
+                        certificate,
+                        name,
+                        self.options.ca_sign_algorithms.as_deref(),
+                    ) {
+                        log::error(reason);
+                        return false;
+                    }
+                    if self.options.update_hostkeys != Some(0) {
+                        self.options.update_hostkeys = Some(0);
+                        log::debug3(
+                            "check_host_key: certificate host key in use; disabling UpdateHostkeys",
+                        );
+                    }
+                }
                 let in_system = |entry: &Entry| system_files.contains(&entry.file);
                 if self.options.update_hostkeys != Some(0)
                     && (in_system(found)
@@ -358,21 +535,22 @@ impl Verifier<'_> {
                     );
                 }
                 if check_host_ip && ip_status == Status::New {
-                    if access != Access::ReadWrite {
+                    if *access != Access::ReadWrite {
                         log::info(&format!(
                             "{label} host key for IP address '{}' not in list of known hosts.",
-                            truncate(&ip, 128)
+                            truncate(ip, 128)
                         ));
-                    } else if !add_host(&user_files[0], &ip, key, self.hash_known_hosts()) {
+                    } else if !add_host(&user_files[0], ip, key.key_data(), self.hash_known_hosts())
+                    {
                         log::info(&format!(
                             "Failed to add the {label} host key for IP address '{}' to the list of known hosts ({}).",
-                            truncate(&ip, 128),
+                            truncate(ip, 128),
                             truncate(&user_files[0], 500)
                         ));
                     } else {
                         log::info(&format!(
                             "Warning: Permanently added the {label} host key for IP address '{}' to the list of known hosts.",
-                            truncate(&ip, 128)
+                            truncate(ip, 128)
                         ));
                     }
                 } else if self.options.visual_host_key == Some(1) {
@@ -396,13 +574,13 @@ impl Verifier<'_> {
                         break 'new;
                     }
                 }
-                if access != Access::ReadWrite {
+                if *access != Access::ReadWrite || want_cert {
                     return false;
                 }
                 if strict == STRICT_HOSTKEY_YES {
                     log::error(&format!(
                         "No {label} host key is known for {} and you have requested strict checking.",
-                        truncate(&host, 200)
+                        truncate(host, 200)
                     ));
                     return false;
                 }
@@ -411,14 +589,14 @@ impl Verifier<'_> {
                     let mut message = format!(
                         "The authenticity of host '{} ({ip})' can't be established.\n\
                          {label} key fingerprint is: {fingerprint}",
-                        truncate(&host, 200)
+                        truncate(host, 200)
                     );
                     if self.options.visual_host_key == Some(1) {
                         message.push('\n');
                         message.push_str(&keyfmt::randomart(key.key_data(), hash));
                     }
                     message.push('\n');
-                    message.push_str(&other_names_message(&host, key, &all_files));
+                    message.push_str(&other_names_message(host, key, all_files));
                     message.push_str(
                         "\nAre you sure you want to continue connecting (yes/no/[fingerprint])? ",
                     );
@@ -433,13 +611,17 @@ impl Verifier<'_> {
                 let (added, recorded) = if check_host_ip && ip_status == Status::New {
                     let line = format!("{host},{ip}");
                     let added = if store_hash {
-                        add_host(file, &host, key, true) && add_host(file, &ip, key, true)
+                        add_host(file, host, key.key_data(), true)
+                            && add_host(file, ip, key.key_data(), true)
                     } else {
-                        add_host(file, &line, key, false)
+                        add_host(file, &line, key.key_data(), false)
                     };
                     (added, line)
                 } else {
-                    (add_host(file, &host, key, store_hash), host.clone())
+                    (
+                        add_host(file, host, key.key_data(), store_hash),
+                        host.clone(),
+                    )
                 };
                 if added {
                     log::info(&format!(
@@ -465,14 +647,21 @@ impl Verifier<'_> {
                 if strict != STRICT_HOSTKEY_OFF {
                     log::error(&format!(
                         "{label} host key for {} was revoked and you have requested strict checking.",
-                        truncate(&host, 200)
+                        truncate(host, 200)
                     ));
                     return false;
                 }
                 unsafe_continue = true;
             }
             Status::Changed(found) => {
-                if access == Access::Quiet {
+                if want_cert {
+                    log::debug(&format!(
+                        "Host certificate authority does not match @cert-authority in {}:{}",
+                        found.file, found.line
+                    ));
+                    return false;
+                }
+                if *access == Access::Quiet {
                     return false;
                 }
                 if check_host_ip && host_ip_differ {
@@ -498,7 +687,7 @@ impl Verifier<'_> {
                         ));
                     }
                 }
-                warn_changed_key(key, hash);
+                warn_changed_key(key.key_data(), hash);
                 if let Some(file) = user_files.first().or(system_files.first()) {
                     log::error(&format!(
                         "Add correct host key in {} to get rid of this message.",
@@ -514,7 +703,7 @@ impl Verifier<'_> {
                 if strict != STRICT_HOSTKEY_OFF {
                     log::error(&format!(
                         "Host key for {} has changed and you have requested strict checking.",
-                        truncate(&host, 200)
+                        truncate(host, 200)
                     ));
                     return false;
                 }
@@ -532,8 +721,8 @@ impl Verifier<'_> {
             let mut message = format!(
                 "Warning: the {label} host key for '{}' differs from the key for the IP address '{}'\n\
                  Offending key for IP in {}:{}",
-                truncate(&host, 200),
-                truncate(&ip, 128),
+                truncate(host, 200),
+                truncate(ip, 128),
                 ip_found.file,
                 ip_found.line
             );
@@ -626,7 +815,7 @@ impl Verifier<'_> {
 const MAX_OTHER_NAMES: usize = 8;
 
 /// The names `key` is known under besides `host` (`other_hostkeys_message`).
-fn other_names_message(host: &str, key: &PublicKey, files: &[String]) -> String {
+fn other_names_message(host: &str, key: &HostKey, files: &[String]) -> String {
     let mut names = Vec::new();
     for file in files {
         let Ok(bytes) = std::fs::read(file) else {
@@ -686,7 +875,7 @@ fn tilde_unexpand(path: &str) -> String {
 
 /// Append an entry for `host` (lowercased, or hashed) to `file`, creating
 /// `~/.ssh` if that is where it goes (`add_host_to_hostfile`).
-fn add_host(file: &str, host: &str, key: &PublicKey, store_hash: bool) -> bool {
+fn add_host(file: &str, host: &str, key: &KeyData, store_hash: bool) -> bool {
     use std::io::{Read, Seek, SeekFrom, Write};
 
     create_user_ssh_dir(file);
@@ -720,7 +909,7 @@ fn add_host(file: &str, host: &str, key: &PublicKey, store_hash: bool) -> bool {
     } else {
         host
     };
-    let Ok(text) = PublicKey::new(key.key_data().clone(), "").to_openssh() else {
+    let Ok(text) = PublicKey::new(key.clone(), "").to_openssh() else {
         return false;
     };
     if let Err(err) = f.write_all(format!("{name} {text}\n").as_bytes()) {
@@ -765,9 +954,81 @@ fn create_user_ssh_dir(file: &str) {
     }
 }
 
+/// Whether a host certificate signed by a trusted CA is good for `name`
+/// (`sshkey_cert_check_host`), or why not.
+fn check_certificate(
+    certificate: &Certificate,
+    name: &str,
+    ca_algorithms: Option<&str>,
+) -> Result<(), &'static str> {
+    if certificate.cert_type() != CertType::Host {
+        return Err("Certificate invalid: not a host certificate");
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    if now < certificate.valid_after() {
+        return Err("Certificate invalid: not yet valid");
+    }
+    if now >= certificate.valid_before() {
+        return Err("Certificate invalid: expired");
+    }
+    if certificate.valid_principals().is_empty() {
+        return Err("Certificate lacks principal list");
+    }
+    if !certificate
+        .valid_principals()
+        .iter()
+        .any(|principal| match_pattern(name, principal))
+    {
+        return Err("Certificate invalid: name is not a listed principal");
+    }
+    if !certificate.critical_options().is_empty() {
+        return Err("Certificate contains unsupported critical options");
+    }
+    if let Some(allowed) = ca_algorithms {
+        let algorithm = certificate.signature().algorithm();
+        if match_pattern_list(algorithm.as_str(), allowed, false) != 1 {
+            return Err("Certificate signed with disallowed algorithm");
+        }
+    }
+    Ok(())
+}
+
+/// A certificate's validity period, as OpenSSH's debug output shows it.
+fn validity(certificate: &Certificate) -> String {
+    let format = |seconds: u64| {
+        let time = i64::try_from(seconds).unwrap_or(i64::MAX);
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        let mut text = [0 as libc::c_char; 64];
+        // SAFETY: localtime_r and strftime write only into the buffers given.
+        unsafe {
+            if libc::localtime_r(&time, &mut tm).is_null()
+                || libc::strftime(
+                    text.as_mut_ptr(),
+                    text.len(),
+                    c"%Y-%m-%dT%H:%M:%S".as_ptr(),
+                    &tm,
+                ) == 0
+            {
+                return seconds.to_string();
+            }
+            std::ffi::CStr::from_ptr(text.as_ptr())
+                .to_string_lossy()
+                .into_owned()
+        }
+    };
+    match (certificate.valid_after(), certificate.valid_before()) {
+        (0, u64::MAX) => "forever".to_string(),
+        (0, before) => format!("before {}", format(before)),
+        (after, u64::MAX) => format!("after {}", format(after)),
+        (after, before) => format!("from {} to {}", format(after), format(before)),
+    }
+}
+
 /// The "REMOTE HOST IDENTIFICATION HAS CHANGED" banner.
-fn warn_changed_key(key: &PublicKey, hash: FingerprintHash) {
-    let fingerprint = keyfmt::fingerprint(key.key_data(), hash);
+fn warn_changed_key(key: &KeyData, hash: FingerprintHash) {
+    let fingerprint = keyfmt::fingerprint(key, hash);
     for line in [
         "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@",
         "@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @",
@@ -780,7 +1041,7 @@ fn warn_changed_key(key: &PublicKey, hash: FingerprintHash) {
     }
     log::error(&format!(
         "The fingerprint for the {} key sent by the remote host is\n{fingerprint}.",
-        keyfmt::type_label(key.key_data())
+        keyfmt::type_label(key)
     ));
     log::error("Please contact your system administrator.");
 }
@@ -819,25 +1080,25 @@ mod tests {
     #[test]
     fn statuses() {
         let (_dir, keys) = known(&format!("host {ED25519}\n"));
-        assert!(matches!(keys.check(&key(ED25519)), Status::Ok(e) if e.line == 1));
+        assert!(matches!(keys.check(&HostKey::Plain(key(ED25519))), Status::Ok(e) if e.line == 1));
         assert!(matches!(
-            keys.check(&key(ED25519_OTHER)),
+            keys.check(&HostKey::Plain(key(ED25519_OTHER))),
             Status::Changed(_)
         ));
 
         let (_dir, keys) = known(&format!("other {ED25519}\n"));
-        assert_eq!(keys.check(&key(ED25519)), Status::New);
+        assert_eq!(keys.check(&HostKey::Plain(key(ED25519))), Status::New);
 
         // A match anywhere wins over a different key before it.
         let (_dir, keys) = known(&format!("host {ED25519_OTHER}\nhost {ED25519}\n"));
-        assert!(matches!(keys.check(&key(ED25519)), Status::Ok(e) if e.line == 2));
+        assert!(matches!(keys.check(&HostKey::Plain(key(ED25519))), Status::Ok(e) if e.line == 2));
 
         let (_dir, keys) = known(&format!("host {ED25519}\n@revoked host {ED25519}\n"));
-        assert_eq!(keys.check(&key(ED25519)), Status::Revoked);
+        assert_eq!(keys.check(&HostKey::Plain(key(ED25519))), Status::Revoked);
 
         // CA keys don't count for plain keys.
         let (_dir, keys) = known(&format!("@cert-authority host {ED25519_OTHER}\n"));
-        assert_eq!(keys.check(&key(ED25519)), Status::New);
+        assert_eq!(keys.check(&HostKey::Plain(key(ED25519))), Status::New);
     }
 
     #[test]
@@ -913,7 +1174,7 @@ mod tests {
             peer: "192.0.2.1:22".parse().unwrap(),
             confirm: &mut confirm,
         }
-        .verify("h", port, &key(ED25519));
+        .verify("h", port, &HostKey::Plain(key(ED25519)));
         let messages = log::captured();
         let file = std::fs::read_to_string(&path).unwrap();
         (accepted, messages, questions, file)
@@ -1050,7 +1311,7 @@ mod tests {
             peer: "192.0.2.1:22".parse().unwrap(),
             confirm: &mut no,
         }
-        .verify("192.0.2.1", 22, &key(ED25519));
+        .verify("192.0.2.1", 22, &HostKey::Plain(key(ED25519)));
         log::captured();
         assert_eq!(options.check_host_ip, Some(0));
     }

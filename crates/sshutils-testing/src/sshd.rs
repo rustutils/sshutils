@@ -52,6 +52,17 @@ impl Sshd {
     /// [`host_key_pub`](Self::host_key_pub); all are in
     /// [`host_key_pub_of`](Self::host_key_pub_of).
     pub fn start_with_host_keys(openssh: &Openssh, types: &[&str]) -> Sshd {
+        Sshd::start_with(openssh, types, |_| String::new())
+    }
+
+    /// Like [`start_with_host_keys`](Self::start_with_host_keys); `setup`
+    /// runs in the server's directory once the keys exist (to sign a host
+    /// certificate, say) and returns extra `sshd_config` lines.
+    pub fn start_with(
+        openssh: &Openssh,
+        types: &[&str],
+        setup: impl FnOnce(&Path) -> String,
+    ) -> Sshd {
         let dir = tempfile::tempdir().expect("create sshd directory");
         let keygen = openssh.require_tool("ssh-keygen");
         let generate = |key: &str, key_type: &str| {
@@ -83,12 +94,14 @@ impl Sshd {
         )
         .expect("write authorized_keys");
 
+        let extra_config = setup(dir.path());
+
         // Binding to port 0 and releasing it races with other processes, so
         // retry a few times if the port gets taken in between.
         let mut last_log = String::new();
         for _ in 0..5 {
             let port = free_port();
-            write_configs(openssh, dir.path(), port, types);
+            write_configs(openssh, dir.path(), port, types, &extra_config);
             match spawn(openssh, dir.path()) {
                 Ok((child, log)) => {
                     return Sshd {
@@ -158,7 +171,7 @@ fn free_port() -> u16 {
         .port()
 }
 
-fn write_configs(openssh: &Openssh, dir: &Path, port: u16, types: &[&str]) {
+fn write_configs(openssh: &Openssh, dir: &Path, port: u16, types: &[&str], extra: &str) {
     let d = dir.display();
     let host_keys: String = types
         .iter()
@@ -182,6 +195,7 @@ fn write_configs(openssh: &Openssh, dir: &Path, port: u16, types: &[&str]) {
     if let Some(sftp_server) = openssh.tool("sftp-server") {
         writeln!(sshd_config, "Subsystem sftp {}", sftp_server.display()).unwrap();
     }
+    sshd_config.push_str(extra);
     std::fs::write(dir.join("sshd_config"), sshd_config).expect("write sshd_config");
 
     let host_key = std::fs::read_to_string(dir.join("host_key.pub")).expect("read host key");
