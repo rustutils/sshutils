@@ -77,9 +77,15 @@ fn host_key_algorithms(options: &Options, known: &HostKeys) -> String {
 
 /// russh's configuration for this connection.
 fn config(options: &Options, host_key_algorithms: &str) -> client::Config {
-    let kex = supported(options.kex_algorithms.as_deref().unwrap_or(""), |n| {
+    let mut kex = supported(options.kex_algorithms.as_deref().unwrap_or(""), |n| {
         russh::kex::Name::try_from(n).ok()
     });
+    // Like OpenSSH, always ask for extension negotiation (RFC 8308, for
+    // server-sig-algs) and strict key exchange.
+    kex.extend([
+        russh::kex::EXTENSION_SUPPORT_AS_CLIENT,
+        russh::kex::EXTENSION_OPENSSH_STRICT_KEX_AS_CLIENT,
+    ]);
     let cipher = supported(options.ciphers.as_deref().unwrap_or(""), |n| {
         russh::cipher::Name::try_from(n).ok()
     });
@@ -612,6 +618,12 @@ mod tests {
                 .all(|m| !m.as_ref().starts_with("umac"))
         );
         assert!(!config.preferred.mac.is_empty());
+        // Extension negotiation and strict key exchange, at the end.
+        let kex: Vec<&str> = config.preferred.kex.iter().map(|k| k.as_ref()).collect();
+        assert_eq!(
+            kex[kex.len() - 2..],
+            ["ext-info-c", "kex-strict-c-v00@openssh.com"]
+        );
         // Certificates are offered in their place in the list.
         let config2 = super::config(
             &options,
