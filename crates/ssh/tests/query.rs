@@ -1,10 +1,10 @@
 //! `ssh -Q` compared against OpenSSH's.
 //!
 //! The algorithm lists are those russh implements, so they are compared as
-//! an ordered subset of OpenSSH 10.5's lists, as is `-Q help`, to which
+//! an ordered subset of OpenSSH's lists, as is `-Q help`, to which
 //! distributions add; everything else must match.
 
-use sshutils_testing::{Comparison, Differential, Openssh, require_openssh};
+use sshutils_testing::{Comparison, Differential, require_openssh};
 
 const OURS: &str = env!("CARGO_BIN_EXE_ssh");
 
@@ -29,18 +29,6 @@ fn same(ssh: &Differential, args: &[&str]) {
         comparison.ours.outcome.stdout, comparison.theirs.outcome.stdout,
         "{comparison:?}"
     );
-}
-
-/// Lists only compared in full against the release we follow.
-fn recent(openssh: &Openssh) -> bool {
-    let recent = openssh.at_least(10, 5);
-    if !recent {
-        eprintln!(
-            "not comparing lists: needs OpenSSH 10.5, found {}",
-            openssh.version()
-        );
-    }
-    recent
 }
 
 #[test]
@@ -69,12 +57,10 @@ fn algorithm_lists() {
         let comparison = run(&ssh, &["-Q", query]);
         let (ours, theirs) = (&comparison.ours.outcome, &comparison.theirs.outcome);
         assert!(!ours.stdout.trim().is_empty(), "{comparison:?}");
-        if recent(&openssh) {
-            assert!(
-                ordered_subset(&ours.stdout, &theirs.stdout),
-                "{comparison:?}"
-            );
-        }
+        assert!(
+            ordered_subset(&ours.stdout, &theirs.stdout),
+            "{comparison:?}"
+        );
     }
 }
 
@@ -85,10 +71,8 @@ fn other_queries() {
     same(&ssh, &["-Q", "protocol-version"]);
     // Distributions add queries (Fedora's GSSAPI patch: `kex-gss`).
     let help = run(&ssh, &["-Q", "help"]);
-    if recent(&openssh) {
-        let (ours, theirs) = (&help.ours.outcome, &help.theirs.outcome);
-        assert!(ordered_subset(&ours.stdout, &theirs.stdout), "{help:?}");
-    }
+    let (ours, theirs) = (&help.ours.outcome, &help.theirs.outcome);
+    assert!(ordered_subset(&ours.stdout, &theirs.stdout), "{help:?}");
     for args in [
         &["-Q", "bogus"][..],
         &["-Q", "Cipher"],

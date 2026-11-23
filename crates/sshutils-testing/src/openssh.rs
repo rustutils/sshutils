@@ -16,6 +16,10 @@ const SEARCH_DIRS: &[&str] = &[
     "/usr/local/libexec",
 ];
 
+/// The OpenSSH release the tools follow, and so the oldest the tests
+/// compare against: older releases behave differently in many small ways.
+pub const MINIMUM_VERSION: (u32, u32) = (10, 5);
+
 /// An OpenSSH installation to compare against.
 #[derive(Debug, Clone)]
 pub struct Openssh {
@@ -52,18 +56,23 @@ impl Openssh {
     }
 
     /// Like [`find`](Self::find), but for use at the start of a test: if
-    /// OpenSSH is missing, print a note and return `None` so the test can
-    /// return early. Panics instead if `SSHUTILS_REQUIRE_OPENSSH` is set, so
-    /// CI can't silently skip tests.
+    /// OpenSSH is missing or older than [`MINIMUM_VERSION`], print a note and
+    /// return `None` so the test can return early. Panics instead if
+    /// `SSHUTILS_REQUIRE_OPENSSH` is set, so CI can't silently skip tests.
     pub fn find_or_skip() -> Option<Self> {
-        let found = Self::find();
-        if found.is_none() {
-            if std::env::var_os("SSHUTILS_REQUIRE_OPENSSH").is_some() {
-                panic!("OpenSSH not found, but SSHUTILS_REQUIRE_OPENSSH is set");
-            }
-            eprintln!("skipping: OpenSSH not found (set SSHUTILS_OPENSSH_BINDIR)");
+        let problem = match Self::find() {
+            Some(openssh) if openssh.version_number >= MINIMUM_VERSION => return Some(openssh),
+            Some(openssh) => format!(
+                "{} is older than OpenSSH {}.{}, which the tests compare against",
+                openssh.version, MINIMUM_VERSION.0, MINIMUM_VERSION.1
+            ),
+            None => "OpenSSH not found".to_string(),
+        };
+        if std::env::var_os("SSHUTILS_REQUIRE_OPENSSH").is_some() {
+            panic!("{problem}, but SSHUTILS_REQUIRE_OPENSSH is set");
         }
-        found
+        eprintln!("skipping: {problem} (set SSHUTILS_OPENSSH_BINDIR)");
+        None
     }
 
     /// Absolute path of an OpenSSH program (`ssh-keygen`, `sshd`,
@@ -84,15 +93,5 @@ impl Openssh {
     /// Version string, e.g. `OpenSSH_10.5p1`.
     pub fn version(&self) -> &str {
         &self.version
-    }
-
-    /// `(major, minor)`, e.g. `(10, 5)`.
-    pub fn version_number(&self) -> (u32, u32) {
-        self.version_number
-    }
-
-    /// Whether this OpenSSH is at least `major.minor`.
-    pub fn at_least(&self, major: u32, minor: u32) -> bool {
-        self.version_number >= (major, minor)
     }
 }

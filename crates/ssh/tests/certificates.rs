@@ -177,7 +177,7 @@ fn invalid_certificates() {
         // Not for this host.
         ("ca", &ca, &["-h", "-n", "other.example"][..]),
         ("ca", &ca, &["-h", "-n", "127.0.0.1?"]),
-        // No principals at all (valid for any host before OpenSSH 10.3).
+        // No principals at all.
         ("ca", &ca, &["-h"]),
         // A user certificate.
         ("ca", &ca, &["-n", "127.0.0.1"]),
@@ -196,13 +196,6 @@ fn invalid_certificates() {
             &["-h", "-n", "127.0.0.1", "-t", "rsa-sha2-256"],
         ),
     ] {
-        if options == ["-h"] && !openssh.at_least(10, 3) {
-            eprintln!(
-                "skipping certificates without principals: {} accepts them",
-                openssh.version()
-            );
-            continue;
-        }
         let h = server(&openssh, &cas, signer, options);
         let name = h.name();
         let key = h.host_key("ed25519");
@@ -368,14 +361,7 @@ fn revoked_host_keys() {
             &["-o", &option, "-o", "HostKeyAlgorithms=ssh-ed25519"],
         );
     }
-    // Several files (since OpenSSH 10.3).
-    if !openssh.at_least(10, 3) {
-        eprintln!(
-            "skipping several RevokedHostKeys files: {}",
-            openssh.version()
-        );
-        return;
-    }
+    // Several files.
     let both = format!(
         "RevokedHostKeys={} {}",
         files[1].display(),

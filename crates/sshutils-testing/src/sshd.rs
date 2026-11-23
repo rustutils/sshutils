@@ -187,11 +187,9 @@ fn write_configs(openssh: &Openssh, dir: &Path, port: u16, types: &[&str], extra
          PasswordAuthentication no\n\
          KbdInteractiveAuthentication no\n"
     );
-    // Since 9.8, sshd blocks addresses that fail authentication repeatedly.
-    // Tests deliberately fail logins from 127.0.0.1, so turn that off.
-    if openssh.at_least(9, 8) {
-        sshd_config.push_str("PerSourcePenalties no\n");
-    }
+    // sshd blocks addresses that fail authentication repeatedly. Tests
+    // deliberately fail logins from 127.0.0.1, so turn that off.
+    sshd_config.push_str("PerSourcePenalties no\n");
     if let Some(sftp_server) = openssh.tool("sftp-server") {
         writeln!(sshd_config, "Subsystem sftp {}", sftp_server.display()).unwrap();
     }

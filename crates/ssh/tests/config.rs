@@ -2,11 +2,10 @@
 //! files, and the resolved configuration it prints.
 //!
 //! Distributions patch OpenSSH (Fedora adds GSSAPI key exchange options and
-//! changes the default key exchange algorithms), and older releases print
-//! other keywords and defaults. So each test first runs `-G` with an empty
-//! configuration on both sides and leaves out the keywords that already
-//! differ there. Against OpenSSH 10.5 only the known distribution keywords
-//! and default algorithm lists may differ.
+//! changes the default key exchange algorithms). So each test first runs
+//! `-G` with an empty configuration on both sides and leaves out the
+//! keywords that already differ there; only the known distribution keywords
+//! and default algorithm lists may.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -16,8 +15,7 @@ use sshutils_testing::{Comparison, Differential, Openssh, require_openssh};
 
 const OURS: &str = env!("CARGO_BIN_EXE_ssh");
 
-/// Keywords allowed to differ from OpenSSH 10.5 with an empty
-/// configuration.
+/// Keywords allowed to differ from OpenSSH with an empty configuration.
 const MAY_DIFFER: &[&str] = &[
     // Distribution patches (GSSAPI key exchange).
     "gssapikeyexchange",
@@ -66,21 +64,18 @@ impl Harness {
             .filter(|k| ours.get(*k) != theirs.get(*k))
             .cloned()
             .collect();
-        if openssh.version_number() == (10, 5) {
-            let unexpected: Vec<_> = skip
-                .iter()
-                .filter(|k| !MAY_DIFFER.contains(&k.as_str()))
-                .collect();
-            assert!(
-                unexpected.is_empty(),
-                "-G output differs from OpenSSH 10.5 for {unexpected:?}\n\
-                 --- ours:\n{}\n--- OpenSSH:\n{}",
-                baseline.ours.outcome.stdout,
-                baseline.theirs.outcome.stdout
-            );
-        } else {
-            eprintln!("{}: not comparing {skip:?}", openssh.version());
-        }
+        let unexpected: Vec<_> = skip
+            .iter()
+            .filter(|k| !MAY_DIFFER.contains(&k.as_str()))
+            .collect();
+        assert!(
+            unexpected.is_empty(),
+            "-G output of {} differs for {unexpected:?}\n\
+             --- ours:\n{}\n--- OpenSSH:\n{}",
+            openssh.version(),
+            baseline.ours.outcome.stdout,
+            baseline.theirs.outcome.stdout
+        );
         Harness { ssh, skip }
     }
 
@@ -150,15 +145,6 @@ impl Harness {
         }
         self.assert_same(&case.run());
     }
-}
-
-/// Skip tests that use keywords older releases don't know.
-fn recent(openssh: &Openssh) -> bool {
-    let recent = openssh.at_least(10, 5);
-    if !recent {
-        eprintln!("skipping: needs OpenSSH 10.5, found {}", openssh.version());
-    }
-    recent
 }
 
 #[test]
@@ -429,9 +415,6 @@ Host *
 #[test]
 fn match_blocks() {
     let openssh = require_openssh!();
-    if !recent(&openssh) {
-        return;
-    }
     let h = Harness::new(&openssh);
     let config = "\
 Match host a,b !user root
@@ -527,9 +510,6 @@ Host *
 #[test]
 fn values_and_errors() {
     let openssh = require_openssh!();
-    if !recent(&openssh) {
-        return;
-    }
     let h = Harness::new(&openssh);
     for config in [
         // First value wins; `=` and quoting.
@@ -591,9 +571,6 @@ fn values_and_errors() {
 #[test]
 fn match_localnetwork() {
     let openssh = require_openssh!();
-    if !recent(&openssh) {
-        return;
-    }
     let h = Harness::new(&openssh);
     // Every machine has the loopback addresses; 192.0.2.0/24 and
     // 2001:db8::/32 are documentation ranges no interface uses.
