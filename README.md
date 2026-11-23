@@ -31,9 +31,6 @@ Rust implementations of the OpenSSH tools (`ssh`, `ssh-keygen`, `ssh-agent`,
 | hardware token (FIDO / PKCS#11) support | planned, later |
 | `sshd` | undecided |
 
-See [PLAN.md](PLAN.md) for the roadmap, compatibility definition and testing
-approach.
-
 ## License
 
 Licensed under either of
