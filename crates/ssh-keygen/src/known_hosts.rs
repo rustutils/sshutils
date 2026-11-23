@@ -211,7 +211,8 @@ fn replace_file(path: &Path, lines: &[String]) -> Result<()> {
         .map_err(|e| failed("Cannot stat", e))?
         .permissions()
         .mode()
-        & 0o7777;
+        // As in OpenSSH, write permission is kept for the owner only.
+        & 0o644;
 
     let (temp_path, mut temp) = create_temp(path, mode).map_err(|e| failed("mkstemp for", e))?;
     let mut contents = String::new();
@@ -222,8 +223,8 @@ fn replace_file(path: &Path, lines: &[String]) -> Result<()> {
     let result = temp
         .write_all(contents.as_bytes())
         .and_then(|()| temp.sync_all())
-        // Like the file itself, the temporary file gets the original mode
-        // regardless of the umask.
+        // The new file gets the (reduced) original mode regardless of the
+        // umask.
         .and_then(|()| fs::set_permissions(&temp_path, fs::Permissions::from_mode(mode)));
     if let Err(e) = result {
         let _ = fs::remove_file(&temp_path);
