@@ -36,6 +36,11 @@ pub struct Behaviour {
     pub authorities: Vec<String>,
     /// Passwords it accepts.
     pub passwords: Vec<String>,
+    /// Passwords that have expired: it asks for a new one with
+    /// `change_prompt`, until one in `new_passwords` is given.
+    pub expired: Vec<String>,
+    pub change_prompt: String,
+    pub new_passwords: Vec<String>,
     /// The info requests of each keyboard-interactive attempt, in turn;
     /// without any, keyboard-interactive is refused at once.
     pub challenges: Vec<Challenge>,
@@ -206,10 +211,36 @@ impl server::Handler for Connection {
 
     async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
         self.record(format!("password {user} {password:?}"));
-        Ok(if self.behaviour.passwords.iter().any(|p| p == password) {
+        let behaviour = &self.behaviour;
+        Ok(if behaviour.passwords.iter().any(|p| p == password) {
             Auth::Accept
+        } else if behaviour.expired.iter().any(|p| p == password) {
+            Auth::PasswordChangeRequired {
+                prompt: behaviour.change_prompt.clone().into(),
+            }
         } else {
             Auth::reject()
+        })
+    }
+
+    async fn auth_password_change(
+        &mut self,
+        user: &str,
+        old_password: &str,
+        new_password: &str,
+    ) -> Result<Auth, Self::Error> {
+        self.record(format!(
+            "password-change {user} {old_password:?} {new_password:?}"
+        ));
+        let behaviour = &self.behaviour;
+        Ok(if !behaviour.expired.iter().any(|p| p == old_password) {
+            Auth::reject()
+        } else if behaviour.new_passwords.iter().any(|p| p == new_password) {
+            Auth::Accept
+        } else {
+            Auth::PasswordChangeRequired {
+                prompt: behaviour.change_prompt.clone().into(),
+            }
         })
     }
 

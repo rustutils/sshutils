@@ -211,3 +211,41 @@ fn both_methods() {
         &["a", "b", "c", "d", "secret"],
     );
 }
+
+#[test]
+fn password_change() {
+    let openssh = require_openssh!();
+    let h = Harness::scripted(
+        &openssh,
+        Behaviour {
+            methods: vec![MethodKind::Password],
+            expired: strings(&["old"]),
+            change_prompt: "Your password has \u{1b}[1mexpired\u{1b}[0m.".into(),
+            new_passwords: strings(&["new"]),
+            ..Behaviour::default()
+        },
+    );
+    let password = ["-o", "PreferredAuthentications=password"];
+    for (extra, answers) in [
+        // Password, old password, new password, retyped.
+        (&[][..], &["old", "old", "new", "new"][..]),
+        // A typo when retyping, then a new password the server refuses.
+        (&[], &["old", "old", "new", "nwe", "new", "new"]),
+        (&[], &["old", "old", "weak", "weak", "old", "new", "new"]),
+        (&["-q"], &["old", "old", "new", "nwe", "new", "new"]),
+        (
+            &["-o", "LogLevel=ERROR"],
+            &["old", "old", "new", "nwe", "new", "new"],
+        ),
+        // The wrong old password.
+        (&[], &["old", "wrong", "new", "new", "", "", ""]),
+        (
+            &["-l", "someone", "-o", "HostKeyAlias=alias"],
+            &["old", "old", "new", "new"],
+        ),
+    ] {
+        let mut args = password.to_vec();
+        args.extend(extra);
+        check(&h, &args, answers);
+    }
+}

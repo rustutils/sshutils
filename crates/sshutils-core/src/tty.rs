@@ -52,16 +52,24 @@ pub fn read_passphrase(prompt: &str) -> io::Result<String> {
 /// allowed askpass program is asked instead; failing both, or when the
 /// program is cancelled, the answer is empty.
 pub fn ask_terminal(prompt: &str) -> String {
-    ask_tty(prompt, true)
+    ask_tty(prompt, true).unwrap_or_default()
 }
 
 /// Like [`ask_terminal`], without echo: OpenSSH's `read_passphrase(prompt,
 /// 0)`, which `ssh` uses for passphrases and passwords.
 pub fn ask_terminal_secret(prompt: &str) -> String {
+    ask_tty(prompt, false).unwrap_or_default()
+}
+
+/// Like [`ask_terminal_secret`], but `None` when nothing could be asked:
+/// no terminal and no askpass program, a failed read, or a cancelled
+/// askpass program (OpenSSH's `RP_ALLOW_EOF`). End of input on the
+/// terminal is an empty answer.
+pub fn ask_terminal_secret_or_cancel(prompt: &str) -> Option<String> {
     ask_tty(prompt, false)
 }
 
-fn ask_tty(prompt: &str, echo: bool) -> String {
+fn ask_tty(prompt: &str, echo: bool) -> Option<String> {
     let display = display();
     let require = std::env::var_os("SSH_ASKPASS_REQUIRE");
     let (allowed, preferred) = askpass_rules(display.as_deref(), require.as_deref());
@@ -78,7 +86,7 @@ fn ask_tty(prompt: &str, echo: bool) -> String {
         Some(mut tty) => {
             // Start the prompt at the beginning of the line.
             if tty.write_all(b"\r").is_err() || tty.write_all(prompt.as_bytes()).is_err() {
-                return String::new();
+                return None;
             }
             let saved = if echo { None } else { echo_off(&tty) };
             let mut line = String::new();
@@ -90,15 +98,15 @@ fn ask_tty(prompt: &str, echo: bool) -> String {
                 let _ = tty.write_all(b"\n");
             }
             if read.is_err() {
-                return String::new();
+                return None;
             }
             while line.ends_with(['\n', '\r']) {
                 line.pop();
             }
-            line
+            Some(line)
         }
-        None if allowed => run_askpass(prompt, None).unwrap_or_default(),
-        None => String::new(),
+        None if allowed => run_askpass(prompt, None),
+        None => None,
     }
 }
 

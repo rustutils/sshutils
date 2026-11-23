@@ -3,10 +3,11 @@
 //! `NumberOfPasswordPrompts` times, asking on the terminal (or through an
 //! askpass program).
 
-use russh::client::{AuthResult, KeyboardInteractiveAuthResponse, Prompt};
+use russh::client::{AuthResult, KeyboardInteractiveAuthResponse, PasswordAuthResponse, Prompt};
 use sshutils_config::Options;
 use sshutils_core::tty;
 
+use crate::hostkeys::truncate;
 use crate::log;
 use crate::pubkey::Attempt;
 use crate::transport::Transport;
@@ -50,13 +51,62 @@ impl<'a> Interactive<'a> {
         }
         let prompt = format!("{}@{}'s password: ", self.user, self.host);
         let password = tty::ask_terminal_secret(&prompt);
-        match transport
+        let mut reply = transport
             .handle
-            .authenticate_password(self.user, password)
-            .await
-        {
-            Ok(reply) => Attempt::Replied(reply),
-            Err(_) => Attempt::Closed,
+            .authenticate_password_or_change(self.user, password)
+            .await;
+        loop {
+            match reply {
+                Err(_) => return Attempt::Closed,
+                Ok(PasswordAuthResponse::Success) => {
+                    return Attempt::Replied(AuthResult::Success);
+                }
+                Ok(PasswordAuthResponse::Failure {
+                    remaining_methods,
+                    method_names,
+                    partial_success,
+                }) => {
+                    return Attempt::Replied(AuthResult::Failure {
+                        remaining_methods,
+                        method_names,
+                        partial_success,
+                    });
+                }
+                Ok(PasswordAuthResponse::ChangeRequest { prompt, .. }) => {
+                    let Some((old, new)) = self.change_request(&prompt) else {
+                        // OpenSSH sends nothing then and waits until the
+                        // server gives up; going on with the next method
+                        // is what that wait ends in.
+                        return Attempt::Nothing;
+                    };
+                    reply = transport
+                        .handle
+                        .authenticate_password_change(self.user, old, new)
+                        .await;
+                }
+            }
+        }
+    }
+
+    /// Show the server's message and ask for the old and new passwords,
+    /// like OpenSSH's `input_userauth_passwd_changereq`; `None` when the
+    /// new password can't be read.
+    fn change_request(&self, info: &str) -> Option<(String, String)> {
+        log::debug2("input_userauth_passwd_changereq");
+        // As for keyboard-interactive, a newline is always added.
+        if !info.is_empty() {
+            eprintln!("{}", log::untrusted(info));
+        }
+        let names = format!("{}@{}", truncate(self.user, 30), truncate(self.host, 128));
+        let old = tty::ask_terminal_secret(&format!("Enter {names}'s old password: "));
+        loop {
+            let new =
+                tty::ask_terminal_secret_or_cancel(&format!("Enter {names}'s new password: "))?;
+            let retype = tty::ask_terminal_secret(&format!("Retype {names}'s new password: "));
+            if new == retype {
+                return Some((old, new));
+            }
+            log::info("Mismatch; try again, EOF to quit.");
         }
     }
 
