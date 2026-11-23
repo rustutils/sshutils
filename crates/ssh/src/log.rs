@@ -157,8 +157,13 @@ pub fn print_untrusted(text: &str) {
     if logger().level < INFO {
         return;
     }
-    let text = escape_multibyte(text, utf8_locale());
-    let _ = std::io::stderr().write_all(text.as_bytes());
+    let _ = std::io::stderr().write_all(untrusted(text).as_bytes());
+}
+
+/// `text` from the server escaped for the terminal, as OpenSSH's
+/// `asmprintf` and `fmprintf` do.
+pub fn untrusted(text: &str) -> String {
+    escape_multibyte(text, utf8_locale())
 }
 
 /// Does the locale's character encoding (`LC_CTYPE`) use UTF-8?

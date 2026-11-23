@@ -31,7 +31,7 @@ pub use differential::{Case, Comparison, Differential, Run};
 pub use openssh::Openssh;
 pub use process::{Outcome, command, run};
 pub use russh::MethodKind;
-pub use scripted::{Behaviour, ScriptedServer};
+pub use scripted::{Behaviour, Challenge, ScriptedServer};
 pub use sshd::Sshd;
 
 /// Find OpenSSH or return from the current test.

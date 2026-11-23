@@ -9,6 +9,7 @@ mod auth;
 mod connect;
 mod hostkeys;
 mod identity;
+mod interactive;
 mod log;
 mod pubkey;
 mod query;

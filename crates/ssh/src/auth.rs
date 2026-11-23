@@ -6,6 +6,7 @@ use russh::client::AuthResult;
 use sshutils_config::Options;
 
 use crate::identity::Identities;
+use crate::interactive::Interactive;
 use crate::log;
 use crate::pubkey::{Attempt, Pubkey};
 use crate::transport::Transport;
@@ -186,6 +187,7 @@ pub async fn authenticate(
     let options = transport.options.clone();
     let mut selection = Selection::new(&options);
     let mut pubkey = Pubkey::new(&options, identities, agent_socket);
+    let mut interactive = Interactive::new(&options, user, host);
     log::debug("SSH2_MSG_SERVICE_ACCEPT received");
     let mut method = Method::None;
     let mut result = transport.handle.authenticate_none(user).await;
@@ -235,7 +237,9 @@ pub async fn authenticate(
             method = next;
             let attempt = match method {
                 Method::Publickey => pubkey.attempt(transport, user).await,
-                // The other methods come in the next steps.
+                Method::KeyboardInteractive => interactive.keyboard_interactive(transport).await,
+                Method::Password => interactive.password(transport).await,
+                // Hostbased and GSSAPI come later.
                 _ => Attempt::Nothing,
             };
             match attempt {

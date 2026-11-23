@@ -74,8 +74,8 @@ fn permission_denied() {
             },
         );
         // PreferredAuthentications is the harness's "none" unless given;
-        // nothing is sent beyond "none" until methods are implemented, so
-        // only methods with nothing to send are enabled.
+        // its BatchMode turns password and keyboard-interactive off, and
+        // there are no keys, so nothing is sent beyond "none".
         check_levels(
             &h,
             &[

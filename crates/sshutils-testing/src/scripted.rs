@@ -34,6 +34,37 @@ pub struct Behaviour {
     /// Certificate authorities (`type base64`) whose user certificates it
     /// accepts.
     pub authorities: Vec<String>,
+    /// Passwords it accepts.
+    pub passwords: Vec<String>,
+    /// The info requests of each keyboard-interactive attempt, in turn;
+    /// without any, keyboard-interactive is refused at once.
+    pub challenges: Vec<Challenge>,
+    /// The responses to all of an attempt's challenges that it accepts.
+    pub responses: Vec<String>,
+}
+
+/// One keyboard-interactive info request.
+#[derive(Clone, Debug, Default)]
+pub struct Challenge {
+    pub name: String,
+    pub instructions: String,
+    /// Each prompt, and whether the answer is echoed.
+    pub prompts: Vec<(String, bool)>,
+}
+
+impl Challenge {
+    fn auth(&self) -> Auth {
+        Auth::Partial {
+            name: self.name.clone().into(),
+            instructions: self.instructions.clone().into(),
+            prompts: self
+                .prompts
+                .iter()
+                .map(|(prompt, echo)| (prompt.clone().into(), *echo))
+                .collect::<Vec<_>>()
+                .into(),
+        }
+    }
 }
 
 /// A running [`Behaviour`], on a free port on 127.0.0.1, with an Ed25519
@@ -89,6 +120,8 @@ impl ScriptedServer {
                         behaviour: Arc::clone(&behaviour),
                         log: Arc::clone(&shared_log),
                         partial: false,
+                        round: 0,
+                        responses: Vec::new(),
                     };
                     let config = Arc::clone(&config);
                     tokio::spawn(async move {
@@ -122,6 +155,10 @@ struct Connection {
     log: Arc<Mutex<Vec<String>>>,
     /// A partial success happened.
     partial: bool,
+    /// The keyboard-interactive challenge answered next.
+    round: usize,
+    /// The responses of this keyboard-interactive attempt so far.
+    responses: Vec<String>,
 }
 
 impl Connection {
@@ -164,6 +201,46 @@ impl server::Handler for Connection {
             Auth::Accept
         } else {
             Auth::reject()
+        })
+    }
+
+    async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
+        self.record(format!("password {user} {password:?}"));
+        Ok(if self.behaviour.passwords.iter().any(|p| p == password) {
+            Auth::Accept
+        } else {
+            Auth::reject()
+        })
+    }
+
+    async fn auth_keyboard_interactive<'a>(
+        &'a mut self,
+        user: &str,
+        submethods: &str,
+        response: Option<server::Response<'a>>,
+    ) -> Result<Auth, Self::Error> {
+        let challenges = &self.behaviour.challenges;
+        let Some(response) = response else {
+            self.record(format!(
+                "keyboard-interactive {user} devices {submethods:?}"
+            ));
+            self.round = 0;
+            self.responses.clear();
+            return Ok(match challenges.first() {
+                Some(challenge) => challenge.auth(),
+                None => Auth::reject(),
+            });
+        };
+        let answers: Vec<String> = response
+            .map(|answer| String::from_utf8_lossy(&answer).into_owned())
+            .collect();
+        self.record(format!("responses {user} {answers:?}"));
+        self.responses.extend(answers);
+        self.round += 1;
+        Ok(match challenges.get(self.round) {
+            Some(challenge) => challenge.auth(),
+            None if self.responses == self.behaviour.responses => Auth::Accept,
+            None => Auth::reject(),
         })
     }
 
