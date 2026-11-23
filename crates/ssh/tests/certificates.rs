@@ -368,7 +368,11 @@ fn revoked_host_keys() {
             &["-o", &option, "-o", "HostKeyAlgorithms=ssh-ed25519"],
         );
     }
-    // Several files.
+    // Several files (since OpenSSH 10.3).
+    if !openssh.at_least(10, 3) {
+        eprintln!("skipping several RevokedHostKeys files: {}", openssh.version());
+        return;
+    }
     let both = format!(
         "RevokedHostKeys={} {}",
         files[1].display(),
