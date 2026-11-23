@@ -402,8 +402,8 @@ impl<'a> Reader<'a> {
                     }
                     None => {
                         // A socket path or environment variable.
-                        if !valid_agent_path(&arg) {
-                            fail!("Invalid environment expansion {arg}.");
+                        if let Some(message) = agent_path_error(&mut self.errors, &arg) {
+                            fail!("{message}");
                         }
                         if on {
                             set_once(&mut o.forward_agent, 1);
@@ -940,8 +940,8 @@ impl<'a> Reader<'a> {
             }
             Opcode::IdentityAgent => {
                 let arg = required!();
-                if !valid_agent_path(&arg) {
-                    fail!("Invalid environment expansion {arg}.");
+                if let Some(message) = agent_path_error(&mut self.errors, &arg) {
+                    fail!("{message}");
                 }
                 if on {
                     set_once(&mut o.identity_agent, arg);
@@ -1296,18 +1296,23 @@ fn run_shell(command: &str) -> Option<i32> {
 
 /// `IdentityAgent`/`ForwardAgent` paths may use `${VAR}` (which must be
 /// set); a legacy `$VAR` must be a valid name.
-fn valid_agent_path(arg: &str) -> bool {
-    if expand::expand_dollar(arg).is_err() {
-        return false;
+/// What is wrong with an agent socket path (`IdentityAgent`,
+/// `ForwardAgent`), like OpenSSH: an expansion error (which is logged
+/// first) or a bad legacy `$NAME`.
+fn agent_path_error(errors: &mut Vec<String>, arg: &str) -> Option<String> {
+    if let Err(err) = expand::expand_dollar(arg) {
+        if let expand::ExpandError::MissingVariable(_) = err {
+            errors.push(format!("vdollar_percent_expand: {err}"));
+        }
+        return Some(format!("Invalid environment expansion {arg}."));
     }
     if let Some(name) = arg.strip_prefix('$')
         && !name.starts_with('{')
+        && (name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
     {
-        return !name.is_empty()
-            && !name.starts_with(|c: char| c.is_ascii_digit())
-            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        return Some(format!("Invalid environment name {arg}."));
     }
-    true
+    None
 }
 
 /// `PermitRemoteOpen host:port`: `None` without a host, `Some(false)` for

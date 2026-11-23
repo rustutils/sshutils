@@ -49,6 +49,7 @@ impl Differential {
             stdin: Vec::new(),
             env: Vec::new(),
             agent: None,
+            agent_program: None,
         }
     }
 }
@@ -64,6 +65,7 @@ pub struct Case<'a> {
     stdin: Vec<u8>,
     env: Vec<(OsString, OsString)>,
     agent: Option<&'a Openssh>,
+    agent_program: Option<PathBuf>,
 }
 
 impl<'a> Case<'a> {
@@ -102,6 +104,13 @@ impl<'a> Case<'a> {
         self
     }
 
+    /// Like [`agent`](Self::agent), with another agent program that takes
+    /// OpenSSH's options (ours, say).
+    pub fn agent_program(mut self, program: impl Into<PathBuf>) -> Self {
+        self.agent_program = Some(program.into());
+        self
+    }
+
     pub fn run(self) -> Comparison {
         let ours = self.run_one(&self.differential.ours);
         let theirs = self.run_one(&self.differential.theirs);
@@ -114,9 +123,12 @@ impl<'a> Case<'a> {
 
     fn run_one(&self, program: &Path) -> Run {
         let dir = tempfile::tempdir().expect("create scratch directory");
-        let agent = self
-            .agent
-            .map(|openssh| Agent::start(openssh, &dir.path().join(AGENT_SOCKET)));
+        let socket = dir.path().join(AGENT_SOCKET);
+        let agent = match (&self.agent_program, self.agent) {
+            (Some(program), _) => Some(Agent::start_program(program, &[], &socket)),
+            (None, Some(openssh)) => Some(Agent::start(openssh, &socket)),
+            (None, None) => None,
+        };
         if let Some(setup) = &self.setup {
             setup(dir.path());
         }

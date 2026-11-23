@@ -27,6 +27,17 @@ pub enum Public {
 }
 
 impl Public {
+    /// OpenSSH's `sshkey_equal`: the same key, or the same certificate.
+    pub fn same(&self, other: &Public) -> bool {
+        match (self, other) {
+            (Public::Key(a), Public::Key(b)) => a.key_data() == b.key_data(),
+            (Public::Certificate(a), Public::Certificate(b)) => {
+                a.to_bytes().ok() == b.to_bytes().ok()
+            }
+            _ => false,
+        }
+    }
+
     /// The plain key (a certificate's subject key).
     pub fn key_data(&self) -> &KeyData {
         match self {
@@ -111,6 +122,8 @@ pub struct Identity {
     pub user_provided: bool,
     /// Tried since the last partial success.
     pub tried: bool,
+    /// Held by the agent, which signs with it.
+    pub agent: bool,
 }
 
 impl Identity {
@@ -128,6 +141,9 @@ impl Identity {
         }
         if self.user_provided {
             text.push_str(" explicit");
+        }
+        if self.agent {
+            text.push_str(" agent");
         }
         text
     }
@@ -170,6 +186,7 @@ pub fn load(options: &Options, tokens: &[(char, String)]) -> Result<Identities, 
             key,
             user_provided: file.user_provided,
             tried: false,
+            agent: false,
         });
         // Without CertificateFile, a certificate next to the key.
         if !options.certificate_files.is_empty() {
@@ -188,6 +205,7 @@ pub fn load(options: &Options, tokens: &[(char, String)]) -> Result<Identities, 
                 key: Some(cert),
                 user_provided: file.user_provided,
                 tried: false,
+                agent: false,
             }),
             Some(key) => log::debug(&format!(
                 "load_public_identity_files: key {cert_path} type {} is not a certificate",
@@ -204,6 +222,7 @@ pub fn load(options: &Options, tokens: &[(char, String)]) -> Result<Identities, 
                 key: Some(cert),
                 user_provided: file.user_provided,
                 tried: false,
+                agent: false,
             }),
             Some(key) => log::debug(&format!(
                 "load_public_identity_files: key {filename} type {} is not a certificate",
@@ -335,12 +354,14 @@ fn order_by_priority(list: &mut [Identity]) {
     }
 }
 
-/// The keys to try, in order, like OpenSSH's `pubkey_prepare` (without
-/// agent keys yet): certificates from `CertificateFile`, then identity
-/// files; minus what `PubkeyAcceptedAlgorithms` and the server's
-/// `server-sig-algs` exclude.
+/// The keys to try, in order, like OpenSSH's `pubkey_prepare`:
+/// certificates from `CertificateFile`; the agent's keys (if there is an
+/// agent), those also in identity files first; the other identity files.
+/// Minus what `PubkeyAcceptedAlgorithms` and the server's `server-sig-algs`
+/// exclude. `agent` holds the agent's keys with their comments.
 pub fn prepare(
     identities: &Identities,
+    agent: Option<Vec<(Public, String)>>,
     options: &Options,
     server_sig_algs: Option<&[String]>,
 ) -> Vec<Identity> {
@@ -375,8 +396,41 @@ pub fn prepare(
         certificates.push(id.clone());
     }
     order_by_priority(&mut certificates);
-    order_by_priority(&mut files);
     let mut preferred = certificates;
+    if let Some(agent) = agent {
+        let mut in_files = Vec::new();
+        let mut only_agent = Vec::new();
+        for (key, comment) in agent {
+            if key.too_short(options) {
+                log::debug(&format!(
+                    "pubkey_prepare: ignoring {} agent key: Invalid key length",
+                    key.ssh_name()
+                ));
+                continue;
+            }
+            // Keys from identity files are preferred.
+            let found = files
+                .iter()
+                .position(|id| id.key.as_ref().is_some_and(|k| k.same(&key)));
+            if let Some(i) = found {
+                let mut id = files.remove(i);
+                id.agent = true;
+                in_files.push(id);
+            } else if options.identities_only != Some(1) {
+                only_agent.push(Identity {
+                    filename: comment,
+                    key: Some(key),
+                    user_provided: false,
+                    tried: false,
+                    agent: true,
+                });
+            }
+        }
+        in_files.extend(only_agent);
+        order_by_priority(&mut in_files);
+        preferred.extend(in_files);
+    }
+    order_by_priority(&mut files);
     preferred.extend(files);
     preferred.retain(|id| {
         let Some(key) = &id.key else {
@@ -428,6 +482,7 @@ mod tests {
             key,
             user_provided,
             tried: false,
+            agent: false,
         }
     }
 

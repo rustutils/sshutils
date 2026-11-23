@@ -208,6 +208,31 @@ fn run() -> Result<(), Exit> {
 }
 
 /// Connect to the host and check its key (`ssh_connect` and `ssh_login`).
+/// The agent's socket: `IdentityAgent` (a path, `SSH_AUTH_SOCK`, `none` or
+/// `$VARIABLE`), or `SSH_AUTH_SOCK`, like OpenSSH.
+fn agent_socket(identity_agent: Option<&str>) -> Result<Option<String>, Exit> {
+    let from_env = |name: &str| std::env::var(name).ok();
+    let socket = match identity_agent {
+        None | Some("SSH_AUTH_SOCK") => from_env("SSH_AUTH_SOCK"),
+        Some("none") => None,
+        Some(name) if name.starts_with('$') && !name.starts_with("${") => {
+            let variable = &name[1..];
+            if variable.is_empty()
+                || !variable
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            {
+                return Err(Exit::fatal(format!(
+                    "Invalid IdentityAgent environment variable name {name}"
+                )));
+            }
+            from_env(variable)
+        }
+        Some(path) => Some(path.to_string()),
+    };
+    Ok(socket.filter(|s| !s.is_empty()))
+}
+
 fn connect(resolved: sshutils_config::Resolved) -> Result<(), Exit> {
     if resolved.options.proxy_command.is_some() {
         return Err(Exit::fatal(
@@ -216,6 +241,7 @@ fn connect(resolved: sshutils_config::Resolved) -> Result<(), Exit> {
     }
     let host = resolved.host;
     let identities = identity::load(&resolved.options, &resolved.tokens).map_err(Exit::fatal)?;
+    let agent_socket = agent_socket(resolved.options.identity_agent.as_deref())?;
     let options = Arc::new(resolved.options);
     let addresses = match resolved.addresses {
         Some(addresses) => addresses,
@@ -240,7 +266,15 @@ fn connect(resolved: sshutils_config::Resolved) -> Result<(), Exit> {
             "Authenticating to {host}:{} as '{user}'",
             connect::port(&options)
         ));
-        match auth::authenticate(&mut transport, &identities, &user, &host).await {
+        match auth::authenticate(
+            &mut transport,
+            &identities,
+            agent_socket.as_deref(),
+            &user,
+            &host,
+        )
+        .await
+        {
             Ok(()) => {}
             Err(auth::Failure::Denied) => return Err(Exit::failed()),
             Err(auth::Failure::Closed) => {

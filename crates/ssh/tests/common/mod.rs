@@ -70,12 +70,31 @@ pub struct Case<'a> {
     pub files: Vec<(&'a str, String)>,
     /// Modes set on files afterwards.
     pub modes: Vec<(&'a str, u32)>,
+    /// An agent for each run (at `AGENT_SOCKET`, in `SSH_AUTH_SOCK`);
+    /// `IdentityAgent` is then left alone.
+    pub agent: Option<AgentKind>,
+    /// `ssh-add` arguments run against the agent, after the files are
+    /// written (`["-c", "key"]`, say).
+    pub agent_adds: Vec<Vec<&'a str>>,
     /// Options before the defaults (so they win over them).
     pub args: Vec<&'a str>,
     /// Answers to the prompts, in order; prompting is enabled if given.
     pub answers: Vec<&'a str>,
     /// Files compared afterwards (hashed names normalized).
     pub compare: Vec<&'a str>,
+}
+
+/// Which `ssh-agent` a case runs with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentKind {
+    Openssh,
+    Ours,
+}
+
+/// Our `ssh-agent`, built next to our `ssh` (by a workspace build).
+pub fn our_agent() -> Option<std::path::PathBuf> {
+    let path = Path::new(OURS).with_file_name("ssh-agent");
+    path.exists().then_some(path)
 }
 
 /// The server the clients connect to.
@@ -114,6 +133,8 @@ pub const SERVER_LOG: &str = "server.log";
 pub struct Harness {
     pub server: Server,
     pub ssh: Differential,
+    openssh: Openssh,
+    ssh_add: std::path::PathBuf,
     pub keygen: std::path::PathBuf,
     askpass: tempfile::TempDir,
 }
@@ -141,6 +162,8 @@ impl Harness {
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
         Harness {
             server,
+            openssh: openssh.clone(),
+            ssh_add: openssh.require_tool("ssh-add"),
             ssh: Differential::new(OURS, openssh.require_tool("ssh")),
             keygen: openssh.require_tool("ssh-keygen"),
             askpass,
@@ -199,13 +222,15 @@ impl Harness {
         if !case.args.contains(&"-F") {
             full.extend(["-F".into(), "none".into()]);
         }
+        if case.agent.is_none() {
+            full.extend(["-o".into(), "IdentityAgent=none".into()]);
+        }
         for option in [
             "UserKnownHostsFile=known_hosts",
             "GlobalKnownHostsFile=/dev/null",
             "StrictHostKeyChecking=yes",
             "BatchMode=yes",
             "PreferredAuthentications=none",
-            "IdentityAgent=none",
             // OpenSSH finds ~/.ssh through the passwd database, not $HOME.
             "IdentityFile=none",
             "UpdateHostKeys=no",
@@ -224,6 +249,12 @@ impl Harness {
             .map(|(n, m)| (n.to_string(), *m))
             .collect();
         let keygen = self.keygen.clone();
+        let ssh_add = self.ssh_add.clone();
+        let adds: Vec<Vec<String>> = case
+            .agent_adds
+            .iter()
+            .map(|args| args.iter().map(|a| a.to_string()).collect())
+            .collect();
         let mut run = self.ssh.case(full).setup(move |dir: &Path| {
             use std::os::unix::fs::PermissionsExt;
             for (name, content) in &files {
@@ -248,7 +279,23 @@ impl Harness {
             for (name, mode) in &modes {
                 fs::set_permissions(dir.join(name), fs::Permissions::from_mode(*mode)).unwrap();
             }
+            for args in &adds {
+                let out = sshutils_testing::run(
+                    sshutils_testing::command(&ssh_add, dir)
+                        .args(args)
+                        .env("SSH_AUTH_SOCK", dir.join(sshutils_testing::AGENT_SOCKET)),
+                    b"",
+                );
+                assert_eq!(out.status, Some(0), "ssh-add {args:?}: {}", out.stderr);
+            }
         });
+        match case.agent {
+            Some(AgentKind::Openssh) => run = run.agent(&self.openssh),
+            Some(AgentKind::Ours) => {
+                run = run.agent_program(our_agent().expect("our ssh-agent is built"))
+            }
+            None => {}
+        }
         if let Server::Scripted(server) = &self.server {
             server.take_log();
             run = run.finish(move |dir: &Path| {

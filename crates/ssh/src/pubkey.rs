@@ -2,7 +2,7 @@
 //! offered once (until a partial success), and the private key is only
 //! loaded, asking for its passphrase, when the server accepts the offer.
 //! A key whose public half can't be read without the private key is
-//! loaded first.
+//! loaded first. Keys the agent holds are signed with by the agent.
 
 use std::fs;
 use std::path::Path;
@@ -10,19 +10,27 @@ use std::sync::Arc;
 
 use russh::client::AuthResult;
 use russh::keys::agent::AgentIdentity;
+use russh::keys::agent::client::AgentClient;
 use russh::keys::{HashAlg, PrivateKey, PrivateKeyWithHashAlg};
 use sshutils_config::Options;
 use sshutils_core::keyfile::{self, LoadError};
+use tokio::net::UnixStream;
 
 use crate::hostkeys::truncate;
 use crate::identity::{self, Identities, Identity, Public};
 use crate::log;
 use crate::transport::Transport;
 
+type Agent = AgentClient<UnixStream>;
+
 /// The state of the method during one authentication.
 pub struct Pubkey<'a> {
     options: &'a Options,
     identities: &'a Identities,
+    /// The agent's socket, if any.
+    agent_socket: Option<&'a str>,
+    /// The connection to the agent, once its keys were listed.
+    agent: Option<Agent>,
     /// The keys to try, in turn; prepared on first use.
     keys: Option<Vec<Identity>>,
 }
@@ -38,12 +46,73 @@ pub enum Attempt {
 }
 
 impl<'a> Pubkey<'a> {
-    pub fn new(options: &'a Options, identities: &'a Identities) -> Pubkey<'a> {
+    pub fn new(
+        options: &'a Options,
+        identities: &'a Identities,
+        agent_socket: Option<&'a str>,
+    ) -> Pubkey<'a> {
         Pubkey {
             options,
             identities,
+            agent_socket,
+            agent: None,
             keys: None,
         }
+    }
+
+    /// The agent's keys, after binding it to this session, like OpenSSH's
+    /// `get_agent_identities`; `None` without a usable agent.
+    async fn agent_keys(&mut self, transport: &Transport) -> Option<Vec<(Public, String)>> {
+        let path = self.agent_socket?;
+        log::debug3(&format!(
+            "ssh_get_authentication_socket_path: path '{path}'"
+        ));
+        let mut agent = match AgentClient::connect_uds(path).await {
+            Ok(agent) => agent,
+            Err(err) => {
+                log::debug(&format!(
+                    "get_agent_identities: ssh_get_authentication_socket: {}",
+                    agent_error(&err)
+                ));
+                return None;
+            }
+        };
+        if let Some(binding) = transport.handle.agent_session_binding() {
+            match agent.bind_session(binding, false).await {
+                Ok(()) => log::debug("get_agent_identities: bound agent to hostkey"),
+                Err(err) => log::debug2(&format!(
+                    "get_agent_identities: ssh_agent_bind_hostkey: {}",
+                    agent_error(&err)
+                )),
+            }
+        }
+        let identities = match agent.request_identities().await {
+            Ok(identities) => identities,
+            Err(err) => {
+                log::debug(&format!(
+                    "get_agent_identities: ssh_fetch_identitylist: {}",
+                    agent_error(&err)
+                ));
+                return None;
+            }
+        };
+        log::debug(&format!(
+            "get_agent_identities: agent returned {} keys",
+            identities.len()
+        ));
+        self.agent = Some(agent);
+        Some(
+            identities
+                .into_iter()
+                .map(|identity| match identity {
+                    AgentIdentity::PublicKey { key, comment } => (Public::Key(key), comment),
+                    AgentIdentity::Certificate {
+                        certificate,
+                        comment,
+                    } => (Public::Certificate(Box::new(certificate)), comment),
+                })
+                .collect(),
+        )
     }
 
     /// After a partial success every key may be tried again.
@@ -60,9 +129,18 @@ impl<'a> Pubkey<'a> {
             Err(_) => return Attempt::Closed,
         };
         let options = self.options;
-        let keys = self.keys.get_or_insert_with(|| {
-            identity::prepare(self.identities, options, server_sig_algs.as_deref())
-        });
+        if self.keys.is_none() {
+            let agent = self.agent_keys(transport).await;
+            self.keys = Some(identity::prepare(
+                self.identities,
+                agent,
+                options,
+                server_sig_algs.as_deref(),
+            ));
+        }
+        let Some(keys) = self.keys.as_mut() else {
+            return Attempt::Nothing;
+        };
         loop {
             let Some(first) = keys.first_mut() else {
                 return Attempt::Nothing;
@@ -88,6 +166,7 @@ impl<'a> Pubkey<'a> {
                         options,
                         id: &id,
                         signing: signing_identity(&id, keys),
+                        agent: self.agent.as_mut(),
                     };
                     let reply = match key {
                         Public::Key(key) => {
@@ -161,6 +240,9 @@ fn signing_identity(id: &Identity, keys: &[Identity]) -> Identity {
     let Some(Public::Certificate(cert)) = &id.key else {
         return id.clone();
     };
+    if id.agent {
+        return id.clone();
+    }
     let same_key = keys.iter().find(|other| {
         other
             .key
@@ -169,8 +251,9 @@ fn signing_identity(id: &Identity, keys: &[Identity]) -> Identity {
     });
     if let Some(other) = same_key {
         log::debug2(&format!(
-            "sign_and_send_pubkey: using private key \"{}\" for certificate",
-            other.filename
+            "sign_and_send_pubkey: using private key \"{}\"{} for certificate",
+            other.filename,
+            if other.agent { " from agent" } else { "" }
         ));
         return other.clone();
     }
@@ -208,14 +291,15 @@ impl From<russh::SendError> for SignError {
     }
 }
 
-/// Signs with the private key file, loaded when the server has accepted
-/// the offered key.
+/// Signs with the agent, or with the private key file, loaded when the
+/// server has accepted the offered key.
 struct FileSigner<'a> {
     options: &'a Options,
     /// The identity that was offered.
     id: &'a Identity,
-    /// The identity whose file holds the private key.
+    /// The identity whose file (or agent) holds the private key.
     signing: Identity,
+    agent: Option<&'a mut Agent>,
 }
 
 impl russh::Signer for FileSigner<'_> {
@@ -232,6 +316,26 @@ impl russh::Signer for FileSigner<'_> {
             self.id.describe(self.options)
         ));
         let signing = &self.signing;
+        if signing.agent
+            && let (Some(agent), Some(key)) = (self.agent.as_deref_mut(), &signing.key)
+        {
+            let identity = match key {
+                Public::Key(key) => AgentIdentity::from(key.clone()),
+                Public::Certificate(cert) => AgentIdentity::from((**cert).clone()),
+            };
+            return agent
+                .sign_request(&identity, hash_alg, to_sign)
+                .await
+                .map_err(|err| {
+                    log::error(&format!(
+                        "sign_and_send_pubkey: signing failed for {} \"{}\" from agent: {}",
+                        key.type_label(),
+                        signing.filename,
+                        agent_error(&err)
+                    ));
+                    SignError::NoKey
+                });
+        }
         let private = load_private(&signing.filename, signing.user_provided, self.options)
             .ok_or(SignError::NoKey)?;
         if let Some(key) = &signing.key
@@ -256,6 +360,15 @@ impl russh::Signer for FileSigner<'_> {
         to_sign.extend_from_slice(&length.to_be_bytes());
         to_sign.extend_from_slice(&signature);
         Ok(to_sign)
+    }
+}
+
+/// OpenSSH's description of an agent error (`ssh_err`).
+fn agent_error(err: &russh::keys::Error) -> String {
+    match err {
+        russh::keys::Error::AgentFailure => "agent refused operation".to_string(),
+        russh::keys::Error::IO(io) => crate::io_message(io),
+        _ => "communication with agent failed".to_string(),
     }
 }
 

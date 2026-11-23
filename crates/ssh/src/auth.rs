@@ -179,12 +179,13 @@ fn match_list<'c>(client: &'c str, server: &str) -> Option<(&'c str, usize)> {
 pub async fn authenticate(
     transport: &mut Transport,
     identities: &Identities,
+    agent_socket: Option<&str>,
     user: &str,
     host: &str,
 ) -> Result<(), Failure> {
     let options = transport.options.clone();
     let mut selection = Selection::new(&options);
-    let mut pubkey = Pubkey::new(&options, identities);
+    let mut pubkey = Pubkey::new(&options, identities, agent_socket);
     log::debug("SSH2_MSG_SERVICE_ACCEPT received");
     let mut method = Method::None;
     let mut result = transport.handle.authenticate_none(user).await;
