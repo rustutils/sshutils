@@ -25,9 +25,25 @@ pub fn messages(stderr: &str) -> Vec<String> {
 }
 
 pub fn assert_same(comparison: &Comparison) {
+    assert_same_except(comparison, false);
+}
+
+/// The warning about key exchange without post-quantum protection, which
+/// OpenSSH prints since 10.1 (and we always do).
+fn is_post_quantum_warning(line: &str) -> bool {
+    line.starts_with("** ")
+}
+
+/// Like [`assert_same`]; with `ignore_post_quantum_warning`, our client's
+/// post-quantum warning is ignored (for OpenSSH releases without it).
+pub fn assert_same_except(comparison: &Comparison, ignore_post_quantum_warning: bool) {
     let (ours, theirs) = (&comparison.ours.outcome, &comparison.theirs.outcome);
+    let mut our_messages = messages(&ours.stderr);
+    if ignore_post_quantum_warning {
+        our_messages.retain(|line| !is_post_quantum_warning(line));
+    }
     assert!(
-        ours.status == theirs.status && messages(&ours.stderr) == messages(&theirs.stderr),
+        ours.status == theirs.status && our_messages == messages(&theirs.stderr),
         "outcomes differ for args {:?}\n\
          --- ours: status {:?}\n{}\n--- OpenSSH: status {:?}\n{}",
         comparison.args,
@@ -66,6 +82,9 @@ pub struct Harness {
     pub ssh: Differential,
     pub keygen: std::path::PathBuf,
     askpass: tempfile::TempDir,
+    /// Whether this OpenSSH warns about key exchange without post-quantum
+    /// protection (10.1 and later).
+    warns_post_quantum: bool,
 }
 
 impl Harness {
@@ -84,6 +103,7 @@ impl Harness {
             ssh: Differential::new(OURS, openssh.require_tool("ssh")),
             keygen: openssh.require_tool("ssh-keygen"),
             askpass,
+            warns_post_quantum: openssh.at_least(10, 1),
         }
     }
 
@@ -184,7 +204,7 @@ impl Harness {
             }
         }
         let comparison = run.run();
-        assert_same(&comparison);
+        assert_same_except(&comparison, !self.warns_post_quantum);
         let names = [self.name(), "127.0.0.1".to_string()];
         for file in case.compare.iter().chain(["prompts"].iter()) {
             let read = |run: &sshutils_testing::Run| {
