@@ -370,7 +370,10 @@ fn revoked_host_keys() {
     }
     // Several files (since OpenSSH 10.3).
     if !openssh.at_least(10, 3) {
-        eprintln!("skipping several RevokedHostKeys files: {}", openssh.version());
+        eprintln!(
+            "skipping several RevokedHostKeys files: {}",
+            openssh.version()
+        );
         return;
     }
     let both = format!(
