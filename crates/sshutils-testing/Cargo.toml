@@ -10,5 +10,7 @@ description = "Test harness for sshutils: differential tests against OpenSSH and
 
 [dependencies]
 libc.workspace = true
+russh.workspace = true
 tempfile.workspace = true
+tokio.workspace = true
 

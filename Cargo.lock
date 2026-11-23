@@ -1815,7 +1815,9 @@ name = "sshutils-testing"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "russh",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]

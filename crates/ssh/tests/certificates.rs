@@ -239,7 +239,7 @@ fn revoked_host_keys() {
     let h = server(&openssh, &cas, "ca", &["-h", "-n", "127.0.0.1", "-z", "5"]);
     let name = h.name();
     let key = h.host_key("ed25519");
-    let host_pub = h.sshd.host_key_pub_of("ed25519");
+    let host_pub = h.server.host_key_pub_of("ed25519");
     let ca_pub = cas.path("ca.pub");
     let fingerprint = {
         let out = Command::new(&keygen)

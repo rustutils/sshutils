@@ -45,6 +45,7 @@ impl Differential {
             differential: self,
             args: args.into_iter().map(Into::into).collect(),
             setup: None,
+            finish: None,
             stdin: Vec::new(),
             env: Vec::new(),
             agent: None,
@@ -59,6 +60,7 @@ pub struct Case<'a> {
     differential: &'a Differential,
     args: Vec<OsString>,
     setup: Option<Setup<'a>>,
+    finish: Option<Setup<'a>>,
     stdin: Vec<u8>,
     env: Vec<(OsString, OsString)>,
     agent: Option<&'a Openssh>,
@@ -69,6 +71,13 @@ impl<'a> Case<'a> {
     /// Called once per implementation, each time with a fresh directory.
     pub fn setup(mut self, f: impl Fn(&Path) + 'a) -> Self {
         self.setup = Some(Box::new(f));
+        self
+    }
+
+    /// Called with each scratch directory right after that implementation
+    /// ran (to save state shared between the runs there, say).
+    pub fn finish(mut self, f: impl Fn(&Path) + 'a) -> Self {
+        self.finish = Some(Box::new(f));
         self
     }
 
@@ -120,6 +129,9 @@ impl<'a> Case<'a> {
             command.env("SSH_AUTH_SOCK", agent.socket());
         }
         let outcome = process::run(&mut command, &self.stdin);
+        if let Some(finish) = &self.finish {
+            finish(dir.path());
+        }
         Run {
             dir,
             outcome,

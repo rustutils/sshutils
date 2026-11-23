@@ -158,6 +158,8 @@ struct Outcome {
     kex: Option<String>,
     /// The options after the host key check, which may have restricted them.
     options: Option<Options>,
+    /// The server's disconnect message: reason code and description.
+    disconnect: Option<(u32, String)>,
 }
 
 /// Checks the server's host key for russh.
@@ -233,14 +235,55 @@ impl client::Handler for Client {
         self.outcome.lock().unwrap().kex = Some(names.kex.as_ref().to_string());
         Ok(())
     }
+
+    async fn auth_banner(
+        &mut self,
+        banner: &str,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        log::debug3("input_userauth_banner: entering");
+        if !banner.is_empty() {
+            log::print_untrusted(banner);
+        }
+        Ok(())
+    }
+
+    async fn disconnected(
+        &mut self,
+        reason: client::DisconnectReason<Self::Error>,
+    ) -> Result<(), Self::Error> {
+        match reason {
+            client::DisconnectReason::ReceivedDisconnect(info) => {
+                self.outcome.lock().unwrap().disconnect =
+                    Some((info.reason_code as u32, info.message));
+                Ok(())
+            }
+            client::DisconnectReason::Error(err) => Err(err),
+        }
+    }
 }
 
 /// An established, not yet authenticated connection.
-#[allow(dead_code)] // Authentication comes next.
 pub struct Transport {
     pub handle: Handle<Client>,
     /// The options, as the host key check left them.
     pub options: Options,
+    pub peer: SocketAddr,
+    outcome: Arc<Mutex<Outcome>>,
+}
+
+impl Transport {
+    /// The connection ended: wait for the session to finish and log why,
+    /// like OpenSSH's `sshpkt_fatal`.
+    pub async fn report_closed(self) {
+        let result = self.handle.await;
+        let disconnect = self.outcome.lock().unwrap().disconnect.clone();
+        let err = match result {
+            Err(err) => err,
+            Ok(()) => russh::Error::Disconnect,
+        };
+        report(&err, self.peer, Stage::Established, disconnect);
+    }
 }
 
 /// `<address> port <port>`, as OpenSSH names the peer in messages.
@@ -284,7 +327,12 @@ pub async fn establish(
                 return Err(Failure::HostKey);
             }
             let identification = identification.lock().unwrap().clone();
-            report(&err, peer, identification.as_deref());
+            let disconnect = outcome.lock().unwrap().disconnect.clone();
+            let stage = match &identification {
+                Some(line) => Stage::Identified(line),
+                None => Stage::Banner,
+            };
+            report(&err, peer, stage, disconnect);
             return Err(Failure::Logged);
         }
     };
@@ -304,7 +352,12 @@ pub async fn establish(
         .options
         .take()
         .unwrap_or_else(|| (*options).clone());
-    Ok(Transport { handle, options })
+    Ok(Transport {
+        handle,
+        options,
+        peer,
+        outcome,
+    })
 }
 
 /// Key exchange methods that resist quantum computers.
@@ -312,11 +365,34 @@ fn is_post_quantum(kex: &str) -> bool {
     kex.starts_with("mlkem") || kex.starts_with("sntrup761")
 }
 
+/// How far the connection got before it failed.
+enum Stage<'a> {
+    /// Waiting for the server's identification line.
+    Banner,
+    /// In the key exchange, after this identification line.
+    Identified(&'a str),
+    /// After the key exchange.
+    Established,
+}
+
 /// Log a transport failure like OpenSSH's `sshpkt_fatal`.
-/// `identification` is the server's identification line, if it was read.
-fn report(err: &russh::Error, peer: SocketAddr, identification: Option<&str>) {
+/// `disconnect` is the server's disconnect message, if it sent one.
+fn report(
+    err: &russh::Error,
+    peer: SocketAddr,
+    stage: Stage<'_>,
+    disconnect: Option<(u32, String)>,
+) {
     let remote = remote_id(peer);
-    if let Some(line) = identification
+    if let Some((code, message)) = disconnect {
+        log::error(&format!(
+            "Received disconnect from {remote}:{code}: {}",
+            hostkeys::truncate(&message, 400)
+        ));
+        log::fatal(&format!("Disconnected from {remote}"));
+        return;
+    }
+    if let Stage::Identified(line) = stage
         && let Some(message) = version_mismatch(line)
     {
         log::error(&message.0);
@@ -326,7 +402,7 @@ fn report(err: &russh::Error, peer: SocketAddr, identification: Option<&str>) {
         ));
         return;
     }
-    let in_banner = identification.is_none();
+    let in_banner = matches!(stage, Stage::Banner);
     let io_error = match err {
         russh::Error::IO(io) => Some(io),
         _ => None,

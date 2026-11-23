@@ -151,6 +151,60 @@ pub fn debug3(message: &str) {
     log(DEBUG3, message);
 }
 
+/// Print `text` from the server to stderr as OpenSSH's `fmprintf` does,
+/// whatever the log destination, if messages at `INFO` are shown.
+pub fn print_untrusted(text: &str) {
+    if logger().level < INFO {
+        return;
+    }
+    let text = escape_multibyte(text, utf8_locale());
+    let _ = std::io::stderr().write_all(text.as_bytes());
+}
+
+/// Does the locale's character encoding (`LC_CTYPE`) use UTF-8?
+fn utf8_locale() -> bool {
+    use std::sync::OnceLock;
+    static UTF8: OnceLock<bool> = OnceLock::new();
+    *UTF8.get_or_init(|| {
+        // SAFETY: called once, before other threads could use the locale;
+        // nl_langinfo returns a NUL-terminated string that stays valid
+        // until the next setlocale.
+        unsafe {
+            if libc::setlocale(libc::LC_CTYPE, c"".as_ptr()).is_null() {
+                return false;
+            }
+            let codeset = libc::nl_langinfo(libc::CODESET);
+            !codeset.is_null()
+                && std::ffi::CStr::from_ptr(codeset)
+                    .to_bytes()
+                    .eq_ignore_ascii_case(b"UTF-8")
+        }
+    })
+}
+
+/// Escape like OpenSSH's `vasnmprintf`: newline, return and tab pass, as
+/// do printable characters (only ASCII ones outside a UTF-8 locale); every
+/// byte of anything else becomes `\ooo`.
+fn escape_multibyte(text: &str, utf8: bool) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        let printable = if c.is_ascii() {
+            !c.is_ascii_control() || matches!(c, '\t' | '\n' | '\r')
+        } else {
+            utf8 && !c.is_control()
+        };
+        if printable {
+            out.push(c);
+        } else {
+            let mut bytes = [0; 4];
+            for byte in c.encode_utf8(&mut bytes).bytes() {
+                let _ = write!(out, "\\{byte:03o}");
+            }
+        }
+    }
+    out
+}
+
 /// Escape control characters as `\ooo` octal, like `strnvis` with
 /// `VIS_SAFE | VIS_OCTAL`: tab, newline, return, backspace and bell pass,
 /// as does other printable text. Unlike OpenSSH, printable non-ASCII text
@@ -183,5 +237,18 @@ mod tests {
         assert_eq!(escape("csi\u{9b}"), "csi\\302\\233");
         assert_eq!(escape("del\u{7f}"), "del\\177");
         assert_eq!(escape("grüße"), "grüße");
+    }
+
+    #[test]
+    fn multibyte_escaping() {
+        assert_eq!(escape_multibyte("a\tb\r\nc", false), "a\tb\r\nc");
+        assert_eq!(
+            escape_multibyte("bell\u{7}bs\u{8}", true),
+            "bell\\007bs\\010"
+        );
+        assert_eq!(escape_multibyte("\u{1b}[1m\u{7f}", true), "\\033[1m\\177");
+        assert_eq!(escape_multibyte("grüße", true), "grüße");
+        assert_eq!(escape_multibyte("grüße", false), "gr\\303\\274\\303\\237e");
+        assert_eq!(escape_multibyte("csi\u{9b}", true), "csi\\302\\233");
     }
 }

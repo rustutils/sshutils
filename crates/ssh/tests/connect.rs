@@ -423,7 +423,7 @@ fn host_key_prompts() {
     let fingerprint = {
         let out = std::process::Command::new(&h.keygen)
             .arg("-lf")
-            .arg(h.sshd.host_key_pub_of("ed25519"))
+            .arg(h.server.host_key_pub_of("ed25519"))
             .output()
             .unwrap();
         String::from_utf8(out.stdout)

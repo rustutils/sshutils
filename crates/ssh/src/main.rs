@@ -5,6 +5,7 @@
 //! the server's host key. Authentication comes next.
 
 mod args;
+mod auth;
 mod connect;
 mod hostkeys;
 mod log;
@@ -62,8 +63,13 @@ impl From<UsageError> for Exit {
 }
 
 impl From<sshutils_config::Fatal> for Exit {
+    /// Without a message, the errors have been logged already.
     fn from(err: sshutils_config::Fatal) -> Self {
-        Exit::fatal(err.0)
+        if err.0.is_empty() {
+            Exit::failed()
+        } else {
+            Exit::fatal(err.0)
+        }
     }
 }
 
@@ -221,7 +227,7 @@ fn connect(resolved: sshutils_config::Resolved) -> Result<(), Exit> {
             .await
             .map_err(|()| Exit::failed())?;
         let user = options.user.clone().unwrap_or_default();
-        let _transport = transport::establish(connection, &host, Arc::clone(&options))
+        let mut transport = transport::establish(connection, &host, Arc::clone(&options))
             .await
             .map_err(|failure| match failure {
                 transport::Failure::HostKey => Exit::fatal("Host key verification failed."),
@@ -231,7 +237,16 @@ fn connect(resolved: sshutils_config::Resolved) -> Result<(), Exit> {
             "Authenticating to {host}:{} as '{user}'",
             connect::port(&options)
         ));
-        Err(Exit::fatal("authentication is not supported yet"))
+        match auth::authenticate(&mut transport, &user, &host).await {
+            Ok(()) => {}
+            Err(auth::Failure::Denied) => return Err(Exit::failed()),
+            Err(auth::Failure::Closed) => {
+                transport.report_closed().await;
+                return Err(Exit::failed());
+            }
+        }
+        // Printed whatever the log level, so that tests can tell.
+        Err(Exit::Message(255, "sessions are not supported yet".into()))
     })
 }
 
@@ -471,7 +486,7 @@ fn apply_option(
             let mut reader = Reader::new(o, &context);
             let result = reader.command_line(arg);
             for error in &reader.errors {
-                eprintln!("{error}");
+                log::error(error);
             }
             result?;
         }

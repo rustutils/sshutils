@@ -1097,8 +1097,8 @@ fn warn_changed_key(key: &KeyData, hash: FingerprintHash) {
     log::error("Please contact your system administrator.");
 }
 
-/// OpenSSH prints some paths with `%.100s`.
-fn truncate(text: &str, max: usize) -> &str {
+/// At most `max` characters of `text`, like printing it with `%.<max>s`.
+pub(crate) fn truncate(text: &str, max: usize) -> &str {
     match text.char_indices().nth(max) {
         Some((i, _)) => &text[..i],
         None => text,

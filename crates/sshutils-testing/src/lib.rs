@@ -9,6 +9,9 @@
 //!   each implementation its own.
 //! - [`Sshd`] starts a throwaway, unprivileged OpenSSH server on a free
 //!   localhost port, with keys and a client config to log in to it.
+//! - [`ScriptedServer`] is a russh server whose authentication follows a
+//!   [`Behaviour`], for what an unprivileged sshd can't do; it records the
+//!   requests clients send.
 //!
 //! Every process is started with a clean environment, without a controlling
 //! terminal and with stdin from a pipe, so nothing from the developer's own
@@ -20,12 +23,15 @@ mod agent;
 mod differential;
 mod openssh;
 mod process;
+mod scripted;
 mod sshd;
 
 pub use agent::{AGENT_SOCKET, Agent};
 pub use differential::{Case, Comparison, Differential, Run};
 pub use openssh::Openssh;
 pub use process::{Outcome, command, run};
+pub use russh::MethodKind;
+pub use scripted::{Behaviour, ScriptedServer};
 pub use sshd::Sshd;
 
 /// Find OpenSSH or return from the current test.

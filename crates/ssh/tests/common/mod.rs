@@ -1,33 +1,47 @@
-//! The harness shared by the tests that connect to a throwaway OpenSSH
-//! server with both clients.
+//! The harness shared by the tests that connect to a throwaway server with
+//! both clients: OpenSSH's sshd, or a scripted russh server.
 
 #![allow(dead_code)]
 
 use std::fs;
 use std::path::Path;
 
-use sshutils_testing::{Comparison, Differential, Openssh, Sshd};
+use sshutils_testing::{Behaviour, Comparison, Differential, Openssh, ScriptedServer, Sshd};
 
 pub const OURS: &str = env!("CARGO_BIN_EXE_ssh");
 
-/// Lines that differ only because we don't authenticate yet.
-pub fn is_authentication_line(line: &str) -> bool {
-    line.contains("Permission denied (") || line == "authentication is not supported yet"
-}
+/// What we print instead of running a session, which isn't supported yet.
+pub const NO_SESSIONS: &str = "sessions are not supported yet";
 
-pub fn messages(stderr: &str) -> Vec<String> {
-    stderr
+/// Exit status and messages, cut where they must stop matching: we don't
+/// run sessions yet, so after authentication succeeded our run ends with
+/// [`NO_SESSIONS`] and status 255, OpenSSH's runs the command; both count
+/// as success up to the "Authenticated to" line (when it is logged).
+pub fn messages(outcome: &sshutils_testing::Outcome) -> (Option<i32>, Vec<String>) {
+    let mut lines: Vec<String> = outcome
+        .stderr
         .lines()
-        .map(|line| line.trim_end_matches('\r'))
-        .filter(|line| !is_authentication_line(line))
-        .map(str::to_string)
-        .collect()
+        .map(|line| line.trim_end_matches('\r').to_string())
+        .collect();
+    let mut status = outcome.status;
+    if status == Some(255) && lines.last().is_some_and(|l| l == NO_SESSIONS) {
+        lines.pop();
+        status = Some(0);
+    }
+    if status == Some(0)
+        && let Some(i) = lines
+            .iter()
+            .position(|l| l.starts_with("Authenticated to "))
+    {
+        lines.truncate(i + 1);
+    }
+    (status, lines)
 }
 
 pub fn assert_same(comparison: &Comparison) {
     let (ours, theirs) = (&comparison.ours.outcome, &comparison.theirs.outcome);
     assert!(
-        ours.status == theirs.status && messages(&ours.stderr) == messages(&theirs.stderr),
+        messages(ours) == messages(theirs),
         "outcomes differ for args {:?}\n\
          --- ours: status {:?}\n{}\n--- OpenSSH: status {:?}\n{}",
         comparison.args,
@@ -61,8 +75,41 @@ pub struct Case<'a> {
     pub compare: Vec<&'a str>,
 }
 
+/// The server the clients connect to.
+pub enum Server {
+    Sshd(Sshd),
+    /// Its requests are compared too.
+    Scripted(ScriptedServer),
+}
+
+impl Server {
+    pub fn port(&self) -> u16 {
+        match self {
+            Server::Sshd(sshd) => sshd.port(),
+            Server::Scripted(server) => server.port(),
+        }
+    }
+
+    /// The `.pub` file of the host key of this type.
+    pub fn host_key_pub_of(&self, key_type: &str) -> std::path::PathBuf {
+        match self {
+            Server::Sshd(sshd) => sshd.host_key_pub_of(key_type),
+            Server::Scripted(server) => {
+                assert_eq!(
+                    key_type, "ed25519",
+                    "the scripted server has an Ed25519 key"
+                );
+                server.host_key_pub()
+            }
+        }
+    }
+}
+
+/// Where each run's requests to a scripted server are saved.
+pub const SERVER_LOG: &str = "server.log";
+
 pub struct Harness {
-    pub sshd: Sshd,
+    pub server: Server,
     pub ssh: Differential,
     pub keygen: std::path::PathBuf,
     askpass: tempfile::TempDir,
@@ -74,13 +121,23 @@ impl Harness {
     }
 
     pub fn with_sshd(openssh: &Openssh, sshd: Sshd) -> Harness {
+        Harness::with_server(openssh, Server::Sshd(sshd))
+    }
+
+    /// A scripted server following `behaviour`.
+    pub fn scripted(openssh: &Openssh, behaviour: Behaviour) -> Harness {
+        let server = ScriptedServer::start(&openssh.require_tool("ssh-keygen"), behaviour);
+        Harness::with_server(openssh, Server::Scripted(server))
+    }
+
+    fn with_server(openssh: &Openssh, server: Server) -> Harness {
         let askpass = tempfile::tempdir().unwrap();
         let script = askpass.path().join("askpass");
         fs::write(&script, ASKPASS).unwrap();
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
         Harness {
-            sshd,
+            server,
             ssh: Differential::new(OURS, openssh.require_tool("ssh")),
             keygen: openssh.require_tool("ssh-keygen"),
             askpass,
@@ -88,12 +145,12 @@ impl Harness {
     }
 
     pub fn port(&self) -> String {
-        self.sshd.port().to_string()
+        self.server.port().to_string()
     }
 
     /// The server's public key of this type, as `type base64`.
     pub fn host_key(&self, key_type: &str) -> String {
-        let text = fs::read_to_string(self.sshd.host_key_pub_of(key_type)).unwrap();
+        let text = fs::read_to_string(self.server.host_key_pub_of(key_type)).unwrap();
         let mut fields = text.split_whitespace();
         format!("{} {}", fields.next().unwrap(), fields.next().unwrap())
     }
@@ -146,6 +203,8 @@ impl Harness {
             "BatchMode=yes",
             "PreferredAuthentications=none",
             "IdentityAgent=none",
+            // OpenSSH finds ~/.ssh through the passwd database, not $HOME.
+            "IdentityFile=none",
             "UpdateHostKeys=no",
         ] {
             full.extend(["-o".into(), option.into()]);
@@ -175,6 +234,13 @@ impl Harness {
                 }
             }
         });
+        if let Server::Scripted(server) = &self.server {
+            server.take_log();
+            run = run.finish(move |dir: &Path| {
+                let log: String = server.take_log().iter().map(|l| format!("{l}\n")).collect();
+                fs::write(dir.join(SERVER_LOG), log).unwrap();
+            });
+        }
         if !case.answers.is_empty() {
             run = run
                 .env("SSH_ASKPASS", self.askpass.path().join("askpass"))
@@ -186,7 +252,7 @@ impl Harness {
         let comparison = run.run();
         assert_same(&comparison);
         let names = [self.name(), "127.0.0.1".to_string()];
-        for file in case.compare.iter().chain(["prompts"].iter()) {
+        for file in case.compare.iter().chain(["prompts", SERVER_LOG].iter()) {
             let read = |run: &sshutils_testing::Run| {
                 fs::read_to_string(run.path(file))
                     .ok()
