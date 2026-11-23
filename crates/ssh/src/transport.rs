@@ -15,6 +15,7 @@ use russh::keys::Algorithm;
 use russh::{AlgorithmKind, HostKeyAlgorithm, Preferred, SshId};
 use sshutils_config::Options;
 use sshutils_config::algorithms::{self, ALL_KEY, DEFAULT_KEY};
+use sshutils_config::values;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::time::Sleep;
@@ -153,6 +154,9 @@ fn config(options: &Options, host_key_algorithms: &str) -> client::Config {
         keepalive_max: options.server_alive_count_max.unwrap_or(3).max(0) as usize,
         inactivity_timeout: None,
         nodelay: true,
+        publickey_host_bound: options
+            .pubkey_authentication
+            .is_some_and(|v| v & values::PUBKEY_AUTH_HOST_BOUND != 0),
         ..Default::default()
     }
 }
@@ -584,6 +588,23 @@ mod tests {
         assert!(client_id(&options).starts_with("SSH-2.0-sshutils_"));
         options.version_addendum = Some("extra words".into());
         assert!(client_id(&options).ends_with(" extra words"));
+    }
+
+    #[test]
+    fn host_bound_public_key_requests() {
+        for (value, bound) in [
+            (values::PUBKEY_AUTH_ALL, true),
+            (values::PUBKEY_AUTH_HOST_BOUND, true),
+            (values::PUBKEY_AUTH_UNBOUND, false),
+            (values::PUBKEY_AUTH_NO, false),
+        ] {
+            let mut options = Options {
+                pubkey_authentication: Some(value),
+                ..Options::default()
+            };
+            options.fill_defaults().unwrap();
+            assert_eq!(config(&options, "").publickey_host_bound, bound, "{value}");
+        }
     }
 
     #[test]

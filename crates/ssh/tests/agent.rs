@@ -213,6 +213,21 @@ fn agent_and_file_keys() {
         // The agent refuses: it can't ask for the confirmation.
         run.check(&["a"], &[&["-q", "-c", "a"]], &[], &[]);
         run.check(&["a"], &[&["-q", "-c", "a"]], &["-i", "a"], &[]);
+        // A key restricted to this host (ssh-add -h) signs only
+        // host-bound requests, which PubkeyAuthentication=unbound turns
+        // off. Our agent doesn't take destination constraints yet.
+        if agent == AgentKind::Ours {
+            continue;
+        }
+        let here = h.name();
+        let restricted = ["-q", "-H", "known_hosts", "-h", &here, "a"];
+        for args in [
+            &[][..],
+            &["-o", "PubkeyAuthentication=host-bound"],
+            &["-o", "PubkeyAuthentication=unbound"],
+        ] {
+            run.check(&["a"], &[&restricted], args, &[]);
+        }
     }
 }
 
