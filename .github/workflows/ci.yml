@@ -40,7 +40,38 @@ jobs:
 
   test:
     name: test
+    # Fedora ships current OpenSSH releases, which the tests compare against.
     runs-on: ubuntu-latest
+    container: fedora:latest
+    steps:
+      # git first, so checkout can fetch the submodule.
+      - name: Install build tools and OpenSSH (reference implementation for tests)
+        run: dnf install -y git gcc gcc-c++ make cmake perl openssh-clients openssh-server
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Container steps run as root, whose account the image locks; sshd
+      # refuses locked accounts, even for the key logins tests use. "*" unlocks
+      # it without allowing any password.
+      - name: Let the test sshd accept root
+        run: usermod -p '*' root
+      - run: ssh -V
+      - run: cargo test --workspace --locked
+        env:
+          # Fail rather than skip tests that compare against OpenSSH.
+          SSHUTILS_REQUIRE_OPENSSH: 1
+          # CI runners have a throwaway home directory, so tests may use
+          # ~/.ssh/agent.
+          SSHUTILS_TEST_HOME_AGENT: 1
+
+  test-ubuntu:
+    name: test (Ubuntu's OpenSSH)
+    # Older OpenSSH, as many users have it: failures are worth knowing about
+    # but don't block.
+    runs-on: ubuntu-latest
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
         with:
@@ -51,10 +82,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y openssh-client openssh-server
       - run: cargo test --workspace --locked
         env:
-          # Fail rather than skip tests that compare against OpenSSH.
           SSHUTILS_REQUIRE_OPENSSH: 1
-          # CI runners have a throwaway home directory, so tests may use
-          # ~/.ssh/agent.
           SSHUTILS_TEST_HOME_AGENT: 1
 
   msrv:
