@@ -52,6 +52,16 @@ pub fn read_passphrase(prompt: &str) -> io::Result<String> {
 /// allowed askpass program is asked instead; failing both, or when the
 /// program is cancelled, the answer is empty.
 pub fn ask_terminal(prompt: &str) -> String {
+    ask_tty(prompt, true)
+}
+
+/// Like [`ask_terminal`], without echo: OpenSSH's `read_passphrase(prompt,
+/// 0)`, which `ssh` uses for passphrases and passwords.
+pub fn ask_terminal_secret(prompt: &str) -> String {
+    ask_tty(prompt, false)
+}
+
+fn ask_tty(prompt: &str, echo: bool) -> String {
     let display = display();
     let require = std::env::var_os("SSH_ASKPASS_REQUIRE");
     let (allowed, preferred) = askpass_rules(display.as_deref(), require.as_deref());
@@ -70,9 +80,16 @@ pub fn ask_terminal(prompt: &str) -> String {
             if tty.write_all(b"\r").is_err() || tty.write_all(prompt.as_bytes()).is_err() {
                 return String::new();
             }
+            let saved = if echo { None } else { echo_off(&tty) };
             let mut line = String::new();
-            let mut reader = io::BufReader::new(tty);
-            if reader.read_line(&mut line).is_err() {
+            let read = io::BufReader::new(&tty).read_line(&mut line);
+            if let Some(saved) = saved {
+                use std::os::fd::AsRawFd;
+                // SAFETY: restores the settings read from this descriptor.
+                unsafe { libc::tcsetattr(tty.as_raw_fd(), libc::TCSAFLUSH, &saved) };
+                let _ = tty.write_all(b"\n");
+            }
+            if read.is_err() {
                 return String::new();
             }
             while line.ends_with(['\n', '\r']) {
@@ -82,6 +99,26 @@ pub fn ask_terminal(prompt: &str) -> String {
         }
         None if allowed => run_askpass(prompt, None).unwrap_or_default(),
         None => String::new(),
+    }
+}
+
+/// Turn off echo on `tty`, returning the settings to restore.
+fn echo_off(tty: &std::fs::File) -> Option<libc::termios> {
+    use std::os::fd::AsRawFd;
+    let fd = tty.as_raw_fd();
+    // SAFETY: termios is plain data, filled in by tcgetattr on an open
+    // descriptor before it is used.
+    unsafe {
+        let mut saved: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(fd, &mut saved) != 0 {
+            return None;
+        }
+        let mut quiet = saved;
+        quiet.c_lflag &= !(libc::ECHO | libc::ECHONL);
+        if libc::tcsetattr(fd, libc::TCSAFLUSH, &quiet) != 0 {
+            return None;
+        }
+        Some(saved)
     }
 }
 

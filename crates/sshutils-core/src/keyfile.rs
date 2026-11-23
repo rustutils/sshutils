@@ -42,23 +42,36 @@ impl std::error::Error for LoadError {}
 /// OpenSSH's `sshkey_perm_ok`: a file we own must not be readable or
 /// writable by group or others. Prints OpenSSH's warning when it is.
 pub fn check_private_permissions(path: &Path) -> Result<(), LoadError> {
+    match permissions_warning(path)? {
+        Some(lines) => {
+            eprintln!("{}", lines.join("\n"));
+            Err(LoadError::BadPermissions)
+        }
+        None => Ok(()),
+    }
+}
+
+/// OpenSSH's warning, line by line, if the private key file at `path` is
+/// accessible by others (see [`check_private_permissions`]).
+pub fn permissions_warning(path: &Path) -> Result<Option<Vec<String>>, LoadError> {
     let meta = fs::metadata(path).map_err(LoadError::Io)?;
     // SAFETY: getuid has no preconditions.
     let uid = unsafe { libc::getuid() };
     let mode = meta.mode() & 0o777;
-    if meta.uid() == uid && mode & 0o077 != 0 {
-        eprintln!(
-            "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n\
-             @         WARNING: UNPROTECTED PRIVATE KEY FILE!          @\n\
-             @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n\
-             Permissions {mode:04o} for '{}' are too open.\n\
-             It is required that your private key files are NOT accessible by others.\n\
-             This private key will be ignored.",
-            path.display()
-        );
-        return Err(LoadError::BadPermissions);
+    if meta.uid() != uid || mode & 0o077 == 0 {
+        return Ok(None);
     }
-    Ok(())
+    Ok(Some(vec![
+        "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@".into(),
+        "@         WARNING: UNPROTECTED PRIVATE KEY FILE!          @".into(),
+        "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@".into(),
+        format!(
+            "Permissions {mode:04o} for '{}' are too open.",
+            path.display()
+        ),
+        "It is required that your private key files are NOT accessible by others.".into(),
+        "This private key will be ignored.".into(),
+    ]))
 }
 
 /// Load a private key: OpenSSH format, or PEM/PKCS#8/PuTTY via russh.

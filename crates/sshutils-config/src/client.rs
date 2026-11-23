@@ -40,6 +40,9 @@ pub struct Resolved {
     /// The host's addresses, if canonicalization already looked them up.
     /// (Their port is the one at the time of the lookup.)
     pub addresses: Option<Vec<std::net::SocketAddr>>,
+    /// The values of the `%` tokens, for what is expanded only when it's
+    /// used (identity files).
+    pub tokens: Vec<(char, String)>,
 }
 
 /// Where the user and system configurations live.
@@ -415,6 +418,7 @@ pub fn resolve_with(
         host,
         command,
         addresses,
+        tokens,
     })
 }
 

@@ -275,7 +275,7 @@ pub fn order_algorithms(algorithms: &str, known: &HostKeys) -> String {
     first.into_iter().chain(last).collect::<Vec<_>>().join(",")
 }
 
-fn fingerprint_hash(options: &Options) -> FingerprintHash {
+pub(crate) fn fingerprint_hash(options: &Options) -> FingerprintHash {
     match options.fingerprint_hash {
         Some(0) => FingerprintHash::Md5,
         Some(1) => FingerprintHash::Sha1,

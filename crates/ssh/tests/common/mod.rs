@@ -65,8 +65,11 @@ eval "printf '%s\n' \"\$ANSWER_$n\""
 /// One differential run.
 #[derive(Default)]
 pub struct Case<'a> {
-    /// Files written into each client's scratch directory first.
+    /// Files written into each client's scratch directory first. Private
+    /// keys (`-----BEGIN` ...) get mode 0600.
     pub files: Vec<(&'a str, String)>,
+    /// Modes set on files afterwards.
+    pub modes: Vec<(&'a str, u32)>,
     /// Options before the defaults (so they win over them).
     pub args: Vec<&'a str>,
     /// Answers to the prompts, in order; prompting is enabled if given.
@@ -215,12 +218,21 @@ impl Harness {
             .iter()
             .map(|(n, c)| (n.to_string(), c.clone()))
             .collect();
+        let modes: Vec<(String, u32)> = case
+            .modes
+            .iter()
+            .map(|(n, m)| (n.to_string(), *m))
+            .collect();
         let keygen = self.keygen.clone();
         let mut run = self.ssh.case(full).setup(move |dir: &Path| {
+            use std::os::unix::fs::PermissionsExt;
             for (name, content) in &files {
                 let path = dir.join(name);
                 fs::create_dir_all(path.parent().unwrap()).unwrap();
                 fs::write(&path, content).unwrap();
+                if content.starts_with("-----BEGIN") {
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+                }
                 if name.ends_with(".hashed") {
                     let status = std::process::Command::new(&keygen)
                         .arg("-H")
@@ -232,6 +244,9 @@ impl Harness {
                         .unwrap();
                     assert!(status.success());
                 }
+            }
+            for (name, mode) in &modes {
+                fs::set_permissions(dir.join(name), fs::Permissions::from_mode(*mode)).unwrap();
             }
         });
         if let Server::Scripted(server) = &self.server {
@@ -285,4 +300,78 @@ pub fn normalize_hashes(text: &str, names: &[String]) -> String {
         })
         .map(|line| line + "\n")
         .collect()
+}
+
+/// Keys made with `ssh-keygen` for a test.
+pub struct Keys {
+    dir: tempfile::TempDir,
+    keygen: std::path::PathBuf,
+}
+
+impl Keys {
+    pub fn new(openssh: &Openssh) -> Keys {
+        Keys {
+            dir: tempfile::tempdir().unwrap(),
+            keygen: openssh.require_tool("ssh-keygen"),
+        }
+    }
+
+    /// Make key `name` of `key_type` with `passphrase` and further
+    /// `ssh-keygen` arguments (`-m PEM`, `-b 2048`, ...).
+    pub fn make(&self, name: &str, key_type: &str, passphrase: &str, args: &[&str]) {
+        let status = std::process::Command::new(&self.keygen)
+            .args(["-q", "-t", key_type, "-N", passphrase, "-C", name])
+            .args(args)
+            .arg("-f")
+            .arg(self.path(name))
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    /// Certify `name.pub` with CA key `ca`, making `name-cert.pub`.
+    pub fn certify(&self, ca: &str, name: &str, args: &[&str]) {
+        let out = std::process::Command::new(&self.keygen)
+            .arg("-s")
+            .arg(self.path(ca))
+            .args(["-I", name])
+            .args(args)
+            .arg(self.path(&format!("{name}.pub")))
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    pub fn path(&self, name: &str) -> std::path::PathBuf {
+        self.dir.path().join(name)
+    }
+
+    /// The contents of a file (`name`, `name.pub`, `name-cert.pub`).
+    pub fn text(&self, file: &str) -> String {
+        fs::read_to_string(self.path(file)).unwrap()
+    }
+
+    /// The public key as `type base64`.
+    pub fn public(&self, name: &str) -> String {
+        let text = self.text(&format!("{name}.pub"));
+        let mut fields = text.split_whitespace();
+        format!("{} {}", fields.next().unwrap(), fields.next().unwrap())
+    }
+}
+
+/// The user tests log in as: the one running them, as sshd requires.
+pub fn current_user() -> String {
+    // SAFETY: getpwuid returns a pointer into static storage or null; the
+    // name is copied out at once.
+    unsafe {
+        let pw = libc::getpwuid(libc::getuid());
+        assert!(!pw.is_null(), "no passwd entry for the current user");
+        std::ffi::CStr::from_ptr((*pw).pw_name)
+            .to_string_lossy()
+            .into_owned()
+    }
 }

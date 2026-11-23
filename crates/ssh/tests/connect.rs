@@ -441,6 +441,7 @@ fn host_key_prompts() {
             args,
             answers,
             compare: vec!["known_hosts"],
+            ..Case::default()
         });
     };
 
@@ -472,7 +473,7 @@ fn host_key_prompts() {
             "UserKnownHostsFile=known_hosts.hashed",
         ],
         answers: vec!["no"],
-        compare: vec![],
+        ..Case::default()
     });
     // Batch mode never asks.
     h.run(Case {
@@ -480,6 +481,7 @@ fn host_key_prompts() {
         args: vec!["-o", "StrictHostKeyChecking=ask"],
         answers: vec!["yes"],
         compare: vec!["known_hosts"],
+        ..Case::default()
     });
     // Neither does a client without a terminal or askpass program.
     h.check(

@@ -5,7 +5,9 @@
 use russh::client::AuthResult;
 use sshutils_config::Options;
 
+use crate::identity::Identities;
 use crate::log;
+use crate::pubkey::{Attempt, Pubkey};
 use crate::transport::Transport;
 
 /// The authentication methods OpenSSH knows, in the order of its table
@@ -176,11 +178,13 @@ fn match_list<'c>(client: &'c str, server: &str) -> Option<(&'c str, usize)> {
 /// lowercase since the configuration was resolved).
 pub async fn authenticate(
     transport: &mut Transport,
+    identities: &Identities,
     user: &str,
     host: &str,
 ) -> Result<(), Failure> {
     let options = transport.options.clone();
     let mut selection = Selection::new(&options);
+    let mut pubkey = Pubkey::new(&options, identities);
     log::debug("SSH2_MSG_SERVICE_ACCEPT received");
     let mut method = Method::None;
     let mut result = transport.handle.authenticate_none(user).await;
@@ -212,6 +216,7 @@ pub async fn authenticate(
             }
         };
         if partial {
+            pubkey.reset();
             log::log(
                 log::VERBOSE,
                 &format!(
@@ -227,31 +232,28 @@ pub async fn authenticate(
                 return Err(Failure::Denied);
             };
             method = next;
-            match attempt(transport, method).await {
-                Some(outcome) => {
+            let attempt = match method {
+                Method::Publickey => pubkey.attempt(transport, user).await,
+                // The other methods come in the next steps.
+                _ => Attempt::Nothing,
+            };
+            match attempt {
+                Attempt::Replied(reply) => {
                     log::debug2(&format!(
                         "we sent a {} packet, wait for reply",
                         method.name()
                     ));
-                    result = outcome;
+                    result = Ok(reply);
                     break;
                 }
-                None => {
+                Attempt::Nothing => {
                     log::debug2("we did not send a packet, disable method");
                     selection.disabled.push(method);
                 }
+                Attempt::Closed => return Err(Failure::Closed),
             }
         }
     }
-}
-
-/// Try `method`; `None` if it had nothing to send.
-async fn attempt(
-    _transport: &mut Transport,
-    _method: Method,
-) -> Option<Result<AuthResult, russh::Error>> {
-    // The methods come in the next steps.
-    None
 }
 
 #[cfg(test)]

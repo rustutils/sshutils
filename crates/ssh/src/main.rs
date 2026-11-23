@@ -8,7 +8,9 @@ mod args;
 mod auth;
 mod connect;
 mod hostkeys;
+mod identity;
 mod log;
+mod pubkey;
 mod query;
 mod transport;
 
@@ -213,6 +215,7 @@ fn connect(resolved: sshutils_config::Resolved) -> Result<(), Exit> {
         ));
     }
     let host = resolved.host;
+    let identities = identity::load(&resolved.options, &resolved.tokens).map_err(Exit::fatal)?;
     let options = Arc::new(resolved.options);
     let addresses = match resolved.addresses {
         Some(addresses) => addresses,
@@ -237,7 +240,7 @@ fn connect(resolved: sshutils_config::Resolved) -> Result<(), Exit> {
             "Authenticating to {host}:{} as '{user}'",
             connect::port(&options)
         ));
-        match auth::authenticate(&mut transport, &user, &host).await {
+        match auth::authenticate(&mut transport, &identities, &user, &host).await {
             Ok(()) => {}
             Err(auth::Failure::Denied) => return Err(Exit::failed()),
             Err(auth::Failure::Closed) => {

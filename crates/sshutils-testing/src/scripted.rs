@@ -25,6 +25,15 @@ pub struct Behaviour {
     pub close_on_none: bool,
     /// Sent before the first reply to an authentication request.
     pub banner: Option<String>,
+    /// Public keys (`type base64`) it accepts; with `partial`, only after
+    /// a partial success.
+    pub keys: Vec<String>,
+    /// Public keys that give a partial success, continuing with public
+    /// keys.
+    pub partial: Vec<String>,
+    /// Certificate authorities (`type base64`) whose user certificates it
+    /// accepts.
+    pub authorities: Vec<String>,
 }
 
 /// A running [`Behaviour`], on a free port on 127.0.0.1, with an Ed25519
@@ -79,6 +88,7 @@ impl ScriptedServer {
                     let handler = Connection {
                         behaviour: Arc::clone(&behaviour),
                         log: Arc::clone(&shared_log),
+                        partial: false,
                     };
                     let config = Arc::clone(&config);
                     tokio::spawn(async move {
@@ -110,12 +120,32 @@ impl ScriptedServer {
 struct Connection {
     behaviour: Arc<Behaviour>,
     log: Arc<Mutex<Vec<String>>>,
+    /// A partial success happened.
+    partial: bool,
 }
 
 impl Connection {
     fn record(&self, entry: String) {
         self.log.lock().unwrap().push(entry);
     }
+
+    /// Whether `key` would be accepted (or give a partial success) now.
+    fn acceptable(&self, key: &russh::keys::PublicKey) -> bool {
+        let behaviour = &self.behaviour;
+        (!self.partial && Connection::knows(&behaviour.partial, key))
+            || ((self.partial || behaviour.partial.is_empty())
+                && Connection::knows(&behaviour.keys, key))
+    }
+
+    fn knows(list: &[String], key: &russh::keys::PublicKey) -> bool {
+        list.iter()
+            .filter_map(|text| russh::keys::PublicKey::from_openssh(text).ok())
+            .any(|known| known.key_data() == key.key_data())
+    }
+}
+
+fn fingerprint(key: &russh::keys::PublicKey) -> String {
+    key.fingerprint(Default::default()).to_string()
 }
 
 impl server::Handler for Connection {
@@ -131,6 +161,72 @@ impl server::Handler for Connection {
             return Err(russh::Error::Disconnect);
         }
         Ok(if self.behaviour.accept_none {
+            Auth::Accept
+        } else {
+            Auth::reject()
+        })
+    }
+
+    async fn auth_publickey_offered(
+        &mut self,
+        user: &str,
+        offer: server::PublicKeyOffer<'_>,
+    ) -> Result<Auth, Self::Error> {
+        self.record(format!(
+            "publickey {user} {} {} offered",
+            offer.algorithm.as_str(),
+            fingerprint(offer.public_key)
+        ));
+        // Only the key is known here, not whether it came in a
+        // certificate: with authorities, the certificate is checked once
+        // signed.
+        Ok(
+            if self.acceptable(offer.public_key) || !self.behaviour.authorities.is_empty() {
+                Auth::Accept
+            } else {
+                Auth::reject()
+            },
+        )
+    }
+
+    async fn auth_publickey(
+        &mut self,
+        user: &str,
+        key: server::VerifiedPublicKey<'_>,
+    ) -> Result<Auth, Self::Error> {
+        self.record(format!(
+            "publickey {user} {} {} signed",
+            key.algorithm.as_str(),
+            fingerprint(key.public_key)
+        ));
+        if !self.partial && Connection::knows(&self.behaviour.partial, key.public_key) {
+            self.partial = true;
+            return Ok(Auth::Reject {
+                proceed_with_methods: Some(MethodSet::from(&[MethodKind::PublicKey][..])),
+                partial_success: true,
+            });
+        }
+        Ok(if self.acceptable(key.public_key) {
+            Auth::Accept
+        } else {
+            Auth::reject()
+        })
+    }
+
+    async fn auth_openssh_certificate(
+        &mut self,
+        user: &str,
+        certificate: &russh::keys::Certificate,
+    ) -> Result<Auth, Self::Error> {
+        let key = russh::keys::PublicKey::from(certificate.public_key().clone());
+        let ca = russh::keys::PublicKey::from(certificate.signature_key().clone());
+        self.record(format!(
+            "certificate {user} {} {} signed by {}",
+            certificate.algorithm().to_certificate_type(),
+            fingerprint(&key),
+            fingerprint(&ca)
+        ));
+        Ok(if Connection::knows(&self.behaviour.authorities, &ca) {
             Auth::Accept
         } else {
             Auth::reject()
