@@ -76,6 +76,9 @@ pub struct Case<'a> {
     /// `ssh-add` arguments run against the agent, after the files are
     /// written (`["-c", "key"]`, say).
     pub agent_adds: Vec<Vec<&'a str>>,
+    /// `ssh-add` arguments run against the agent after `ssh` exits; their
+    /// output is compared (`["-l"]`, say).
+    pub agent_after: Vec<Vec<&'a str>>,
     /// Options before the defaults (so they win over them).
     pub args: Vec<&'a str>,
     /// Answers to the prompts, in order; prompting is enabled if given.
@@ -129,6 +132,9 @@ impl Server {
 
 /// Where each run's requests to a scripted server are saved.
 pub const SERVER_LOG: &str = "server.log";
+
+/// The output of `Case::agent_after`, in each scratch directory.
+pub const AGENT_AFTER: &str = "agent_after";
 
 pub struct Harness {
     pub server: Server,
@@ -296,11 +302,44 @@ impl Harness {
             }
             None => {}
         }
-        if let Server::Scripted(server) = &self.server {
-            server.take_log();
+        let scripted = match &self.server {
+            Server::Scripted(server) => {
+                server.take_log();
+                Some(server)
+            }
+            Server::Sshd(_) => None,
+        };
+        let after: Vec<Vec<String>> = case
+            .agent_after
+            .iter()
+            .map(|args| args.iter().map(|a| a.to_string()).collect())
+            .collect();
+        let ssh_add = self.ssh_add.clone();
+        if scripted.is_some() || !after.is_empty() {
             run = run.finish(move |dir: &Path| {
-                let log: String = server.take_log().iter().map(|l| format!("{l}\n")).collect();
-                fs::write(dir.join(SERVER_LOG), log).unwrap();
+                if let Some(server) = scripted {
+                    let log: String = server.take_log().iter().map(|l| format!("{l}\n")).collect();
+                    fs::write(dir.join(SERVER_LOG), log).unwrap();
+                }
+                if !after.is_empty() {
+                    let mut report = String::new();
+                    for args in &after {
+                        let out = sshutils_testing::run(
+                            sshutils_testing::command(&ssh_add, dir)
+                                .args(args)
+                                .env("SSH_AUTH_SOCK", dir.join(sshutils_testing::AGENT_SOCKET)),
+                            b"",
+                        );
+                        report.push_str(&format!(
+                            "$ ssh-add {}\n{}{}exit {:?}\n",
+                            args.join(" "),
+                            out.stdout,
+                            out.stderr,
+                            out.status
+                        ));
+                    }
+                    fs::write(dir.join(AGENT_AFTER), report).unwrap();
+                }
             });
         }
         if !case.answers.is_empty() {
@@ -314,7 +353,11 @@ impl Harness {
         let comparison = run.run();
         assert_same(&comparison);
         let names = [self.name(), "127.0.0.1".to_string()];
-        for file in case.compare.iter().chain(["prompts", SERVER_LOG].iter()) {
+        for file in case
+            .compare
+            .iter()
+            .chain(["prompts", SERVER_LOG, AGENT_AFTER].iter())
+        {
             let read = |run: &sshutils_testing::Run| {
                 fs::read_to_string(run.path(file))
                     .ok()

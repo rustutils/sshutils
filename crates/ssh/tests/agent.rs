@@ -39,6 +39,19 @@ impl Run<'_> {
     /// unless the name has a dot), `ssh-add` runs (file names) and
     /// arguments.
     fn check(&self, files: &[&str], adds: &[&[&str]], args: &[&str], answers: &[&str]) {
+        self.check_after(files, adds, args, answers, &[]);
+    }
+
+    /// Like [`check`](Self::check), comparing the output of `ssh-add`
+    /// runs afterwards.
+    fn check_after(
+        &self,
+        files: &[&str],
+        adds: &[&[&str]],
+        args: &[&str],
+        answers: &[&str],
+        after: &[&[&str]],
+    ) {
         let h = self.h;
         let mut written = vec![(
             "known_hosts".to_string(),
@@ -74,6 +87,7 @@ impl Run<'_> {
             answers: answers.to_vec(),
             agent: Some(self.agent),
             agent_adds: adds.iter().map(|a| a.to_vec()).collect(),
+            agent_after: after.iter().map(|a| a.to_vec()).collect(),
             ..Case::default()
         });
     }
@@ -260,6 +274,70 @@ fn offered_order() {
         ] {
             run.check(&all, adds, args, &[]);
         }
+    }
+}
+
+#[test]
+fn add_keys_to_agent() {
+    let openssh = require_openssh!();
+    let keys = make_keys(&openssh);
+    keys.make("pem", "rsa", "", &["-m", "PEM"]);
+    // Private keys without their public halves: one that has it inside,
+    // and a PEM key, loaded before it is offered.
+    fs::copy(keys.path("a"), keys.path("a.alone")).unwrap();
+    fs::copy(keys.path("pem"), keys.path("pem.alone")).unwrap();
+    let ca = keys.public("ca");
+    let sshd = sshutils_testing::Sshd::start_with(&openssh, &["ed25519"], move |dir| {
+        fs::write(dir.join("user_ca"), format!("{ca}\n")).unwrap();
+        format!("TrustedUserCAKeys {}\n", dir.join("user_ca").display())
+    });
+    let h = Harness::with_sshd(&openssh, sshd);
+    authorize(&h, &keys, &["a", "enc", "pem"]);
+    let list: &[&[&str]] = &[&["-l"]];
+    for agent in agents() {
+        let run = Run {
+            h: &h,
+            keys: &keys,
+            agent,
+        };
+        let add = |value: &str, files: &[&str], args: &[&str], answers: &[&str]| {
+            let option = format!("AddKeysToAgent={value}");
+            let mut all = vec!["-o", option.as_str()];
+            all.extend(args);
+            run.check_after(files, &[], &all, answers, list);
+        };
+        for value in ["yes", "no", "1h", "confirm 30m"] {
+            add(value, &["a"], &["-i", "a"], &[]);
+        }
+        // A passphrase, a PEM key (no comment), a key without a public
+        // half, and a certificate's key.
+        add("yes", &["enc"], &["-i", "enc"], &["secret"]);
+        add("yes", &["pem"], &["-i", "pem"], &[]);
+        add("yes", &["a.alone"], &["-i", "a.alone"], &[]);
+        add("yes", &["pem.alone"], &["-i", "pem.alone"], &[]);
+        add("yes", &["cert"], &["-i", "cert"], &[]);
+        // Asked through askpass: an empty answer or "yes" agrees.
+        for answer in ["yes", "no", ""] {
+            add("ask", &["a"], &["-i", "a"], &[answer]);
+        }
+        add("ask", &["pem"], &["-i", "pem"], &["yes"]);
+        // Without an agent, or when the agent signs.
+        add("yes", &["a"], &["-i", "a", "-o", "IdentityAgent=none"], &[]);
+        run.check_after(
+            &["a"],
+            &[&["-q", "a"]],
+            &["-i", "a", "-o", "AddKeysToAgent=yes"],
+            &[],
+            list,
+        );
+        // A confirmed key: the agent can't ask, so it refuses to sign.
+        run.check_after(
+            &["a"],
+            &[],
+            &["-i", "a", "-o", "AddKeysToAgent=confirm"],
+            &[],
+            &[&["-l"], &["-T", "a.pub"]],
+        );
     }
 }
 

@@ -18,6 +18,11 @@ pub const YES_NO_ASK_CONFIRM: Multistate = &[
     ("ask", 2),
     ("confirm", 3),
 ];
+/// `AddKeysToAgent` values (`YES_NO_ASK_CONFIRM`).
+pub const ADD_KEYS_NO: i32 = 0;
+pub const ADD_KEYS_YES: i32 = 1;
+pub const ADD_KEYS_ASK: i32 = 2;
+pub const ADD_KEYS_CONFIRM: i32 = 3;
 
 pub const STRICT_HOSTKEY_OFF: i32 = 0;
 pub const STRICT_HOSTKEY_NEW: i32 = 1;

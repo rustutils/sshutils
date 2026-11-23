@@ -9,11 +9,12 @@ use std::path::Path;
 use std::sync::Arc;
 
 use russh::client::AuthResult;
-use russh::keys::agent::AgentIdentity;
 use russh::keys::agent::client::AgentClient;
+use russh::keys::agent::{AgentIdentity, Constraint};
 use russh::keys::{HashAlg, PrivateKey, PrivateKeyWithHashAlg};
-use sshutils_config::Options;
+use sshutils_config::{Options, values};
 use sshutils_core::keyfile::{self, LoadError};
+use sshutils_core::tty;
 use tokio::net::UnixStream;
 
 use crate::hostkeys::truncate;
@@ -167,6 +168,7 @@ impl<'a> Pubkey<'a> {
                         id: &id,
                         signing: signing_identity(&id, keys),
                         agent: self.agent.as_mut(),
+                        agent_socket: self.agent_socket,
                     };
                     let reply = match key {
                         Public::Key(key) => {
@@ -196,10 +198,19 @@ impl<'a> Pubkey<'a> {
                 }
                 None => {
                     log::debug(&format!("Trying private key: {}", id.filename));
-                    let Some(private) = load_private(&id.filename, id.user_provided, options)
+                    let Some((private, comment)) =
+                        load_private(&id.filename, id.user_provided, options)
                     else {
                         continue;
                     };
+                    add_to_agent(
+                        options,
+                        self.agent_socket,
+                        &id.filename,
+                        &private,
+                        comment.as_deref(),
+                    )
+                    .await;
                     let public = Public::Key(private.public_key().clone());
                     let Some(algorithm) =
                         identity::signature_algorithm(&public, options, server_sig_algs.as_deref())
@@ -300,6 +311,8 @@ struct FileSigner<'a> {
     /// The identity whose file (or agent) holds the private key.
     signing: Identity,
     agent: Option<&'a mut Agent>,
+    /// The agent's socket, for `AddKeysToAgent`.
+    agent_socket: Option<&'a str>,
 }
 
 impl russh::Signer for FileSigner<'_> {
@@ -336,8 +349,17 @@ impl russh::Signer for FileSigner<'_> {
                     SignError::NoKey
                 });
         }
-        let private = load_private(&signing.filename, signing.user_provided, self.options)
-            .ok_or(SignError::NoKey)?;
+        let (private, comment) =
+            load_private(&signing.filename, signing.user_provided, self.options)
+                .ok_or(SignError::NoKey)?;
+        add_to_agent(
+            self.options,
+            self.agent_socket,
+            &signing.filename,
+            &private,
+            comment.as_deref(),
+        )
+        .await;
         if let Some(key) = &signing.key
             && key.key_data() != private.public_key().key_data()
         {
@@ -376,11 +398,74 @@ fn keyfmt_label(key: &PrivateKeyWithHashAlg) -> &'static str {
     sshutils_core::keyfmt::type_label(key.public_key().key_data())
 }
 
+/// Add a private key just loaded from `filename` to the agent, if
+/// `AddKeysToAgent` says so, like OpenSSH's `maybe_add_key_to_agent`.
+/// `comment` is the key's (OpenSSH format) comment, if it has one;
+/// otherwise the agent gets the file name.
+async fn add_to_agent(
+    options: &Options,
+    agent_socket: Option<&str>,
+    filename: &str,
+    key: &PrivateKey,
+    comment: Option<&str>,
+) {
+    let mode = options.add_keys_to_agent.unwrap_or(values::ADD_KEYS_NO);
+    if mode == values::ADD_KEYS_NO {
+        return;
+    }
+    let agent = match agent_socket {
+        Some(path) => AgentClient::connect_uds(path).await.ok(),
+        None => None,
+    };
+    let Some(mut agent) = agent else {
+        log::debug3("no authentication agent, not adding key");
+        return;
+    };
+    // OpenSSH formats a missing comment with printf's "%s".
+    if mode == values::ADD_KEYS_ASK
+        && !tty::ask_permission(&format!(
+            "Add key {filename} ({}) to agent?",
+            comment.unwrap_or("(null)")
+        ))
+    {
+        log::debug3("user denied adding this key");
+        return;
+    }
+    let mut key = key.clone();
+    key.set_comment(comment.unwrap_or(filename));
+    match agent.add_identity(&key, &constraints(options)).await {
+        Ok(()) => log::debug(&format!("identity added to agent: {filename}")),
+        Err(err) => log::debug(&format!(
+            "could not add identity to agent: {filename} ({})",
+            agent_error(&err)
+        )),
+    }
+}
+
+/// The constraints `AddKeysToAgent` puts on added keys, in OpenSSH's order.
+fn constraints(options: &Options) -> Vec<Constraint> {
+    let mut constraints = Vec::new();
+    if options.add_keys_to_agent_lifespan > 0 {
+        constraints.push(Constraint::KeyLifetime {
+            seconds: u32::try_from(options.add_keys_to_agent_lifespan).unwrap_or(u32::MAX),
+        });
+    }
+    if options.add_keys_to_agent == Some(values::ADD_KEYS_CONFIRM) {
+        constraints.push(Constraint::Confirm);
+    }
+    constraints
+}
+
 /// Load a private key, asking for its passphrase as needed, like OpenSSH's
 /// `load_identity_file`: first with an empty one, then up to
 /// `NumberOfPasswordPrompts` times (never in batch mode); an empty answer
-/// gives up.
-pub fn load_private(filename: &str, user_provided: bool, options: &Options) -> Option<PrivateKey> {
+/// gives up. Returns the key and, for a key in OpenSSH's format, its
+/// comment.
+pub fn load_private(
+    filename: &str,
+    user_provided: bool,
+    options: &Options,
+) -> Option<(PrivateKey, Option<String>)> {
     let path = Path::new(filename);
     if let Err(err) = fs::metadata(path) {
         let level = if user_provided {
@@ -408,7 +493,7 @@ pub fn load_private(filename: &str, user_provided: bool, options: &Options) -> O
             answer
         };
         match read_private(path, &passphrase) {
-            Ok(key) => {
+            Ok((key, comment)) => {
                 let public = Public::Key(key.public_key().clone());
                 if public.is_rsa()
                     && i64::from(sshutils_core::keyfmt::bits(public.key_data()))
@@ -417,7 +502,7 @@ pub fn load_private(filename: &str, user_provided: bool, options: &Options) -> O
                     log::debug(&format!("Skipping key {filename}: Invalid key length"));
                     return None;
                 }
-                return Some(key);
+                return Some((key, comment));
             }
             Err(LoadError::WrongPassphrase | LoadError::Encrypted) => {
                 if options.batch_mode == Some(1) {
@@ -451,8 +536,9 @@ pub fn load_private(filename: &str, user_provided: bool, options: &Options) -> O
 }
 
 /// Read and decrypt a private key file, refusing (with OpenSSH's warning)
-/// one that others can read.
-fn read_private(path: &Path, passphrase: &str) -> Result<PrivateKey, LoadError> {
+/// one that others can read. The comment is only there for keys in
+/// OpenSSH's format (PEM keys have none, even when empty).
+fn read_private(path: &Path, passphrase: &str) -> Result<(PrivateKey, Option<String>), LoadError> {
     if let Some(lines) = keyfile::permissions_warning(path)? {
         for line in lines {
             log::error(&line);
@@ -463,12 +549,43 @@ fn read_private(path: &Path, passphrase: &str) -> Result<PrivateKey, LoadError> 
         std::io::ErrorKind::InvalidData => LoadError::InvalidFormat,
         _ => LoadError::Io(err),
     })?;
-    keyfile::decode_private(&text, Some(passphrase))
+    let key = keyfile::decode_private(&text, Some(passphrase))?;
+    let comment = text
+        .starts_with("-----BEGIN OPENSSH PRIVATE KEY-----")
+        .then(|| key.comment().as_str_lossy().to_string());
+    Ok((key, comment))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_constraints() {
+        let options = |value: i32, lifespan: i64| Options {
+            add_keys_to_agent: Some(value),
+            add_keys_to_agent_lifespan: lifespan,
+            ..Options::default()
+        };
+        let describe = |value: i32, lifespan: i64| {
+            constraints(&options(value, lifespan))
+                .iter()
+                .map(|c| match c {
+                    Constraint::KeyLifetime { seconds } => format!("life {seconds}"),
+                    Constraint::Confirm => "confirm".to_string(),
+                    Constraint::Extensions { .. } => "extension".to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        assert_eq!(describe(values::ADD_KEYS_YES, 0), "");
+        assert_eq!(describe(values::ADD_KEYS_YES, 3600), "life 3600");
+        assert_eq!(describe(values::ADD_KEYS_CONFIRM, 0), "confirm");
+        assert_eq!(
+            describe(values::ADD_KEYS_CONFIRM, 1800),
+            "life 1800,confirm"
+        );
+    }
 
     #[test]
     fn hashes() {
